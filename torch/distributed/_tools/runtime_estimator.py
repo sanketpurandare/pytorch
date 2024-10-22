@@ -1,6 +1,10 @@
 # Owner(s): ["module: unknown"]
 import math
 import os
+import joblib
+import subprocess
+import numpy as np
+import time
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Set, Tuple
 from typing_extensions import Self
@@ -73,6 +77,13 @@ _CREATE_OPS = {
 
 _IGNORE_OPS = _VIEW_OPS | _CREATE_OPS
 
+# Similar to `flop_registry`, stores the functions that make predictions
+_LEARNED_OPS: Dict[Any, Any] = {}
+
+# Caches the learned models that predict ops' runtimes.
+_LEARNED_OPS_PREDICTORS: Dict[str, Any] = {}
+
+
 __all__ = ["RuntimeEstimator"]
 
 
@@ -143,6 +154,22 @@ class RuntimeEstimator(TorchDispatchMode):
         self.mod_fw_post_order: List[str] = []
         self.mod_bw_post_order: List[str] = []
         self.total_runtime: float = 0.0
+
+        self.gpu_type = self.get_device_type()
+
+    def get_device_type(self) -> int:
+        try:
+            result = subprocess.check_output(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'])
+            gpu_name = result.decode('utf-8').strip()
+
+            if "A100" in gpu_name:
+                return "a100"
+            elif "H100" in gpu_name:
+                return "h100"
+            else:
+                raise ValueError("GPU type not supported")
+        except subprocess.CalledProcessError as e:
+            raise ValueError("Error retrieving GPU name")
 
     # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_subclasses/fake_tensor.py#L1969  # noqa: PGH004,B950
     # NB: returns fake tensors
@@ -275,7 +302,7 @@ class RuntimeEstimator(TorchDispatchMode):
 
     # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_inductor/scheduler.py#L589  # noqa: PGH004,B950
     @classmethod
-    def _roofline_estimate(cls, func, args, kwargs) -> Tuple[Any, float]:  # type: ignore[no-untyped-def]
+    def _get_transfer_time(cls, flat_args_kwargs, flat_outs) -> float:  # type: ignore[no-untyped-def]
         """
         Estimates the runtime of a function using a roofline cost model.
 
@@ -309,62 +336,72 @@ class RuntimeEstimator(TorchDispatchMode):
             )
             return mem_consumed
 
-        def get_compute_time(func_packet, args, kwargs, out, out_dtypes) -> float:  # type: ignore[no-untyped-def]
-            """
-            Estimates the compute time of an aten operator.
+        gpu_memory_bandwidth = get_gpu_dram_gbps()
+        read_bytes = sum(
+            get_num_bytes(t)
+            for t in flat_args_kwargs
+            if isinstance(t, torch.Tensor)
+        )
+        write_bytes = sum(
+            get_num_bytes(t) for t in flat_outs if isinstance(t, torch.Tensor)
+        )
+        counted_bytes = read_bytes + write_bytes
+        # The GPU memory bandwidth is in GB/s so the transfer time is in nanoseconds
+        transfer_time = counted_bytes / gpu_memory_bandwidth
+        return transfer_time
 
-            Args:
-                func_packet: The operator overload packet.
-                args: The arguments to the operator.
-                kwargs: The keyword arguments to the operator.
-                out: The output of the operator.
-                out_dtypes: The output data types.
+    @classmethod
+    def _get_compute_time(cls, func_packet, args, kwargs, out, out_dtypes) -> float:  # type: ignore[no-untyped-def]
+        """
+        Estimates the compute time of an aten operator.
 
-            Returns:
-                float: The estimated compute time in nanoseconds.
-            """
-            if func_packet in flop_registry:
-                assert (
-                    len(out_dtypes) == 1
-                ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
-                dtype = out_dtypes.pop()
-                # This actually gives peta-FLOPs/s hence multiply by 1e15 to get the FLOPs/s
-                peak_gpu_flops = get_device_tflops(dtype) * 1e15
-                # We can expect to achieve 75% of theoretical peak flops
-                factor = 0.75
-                peak_empirical_flops = factor * peak_gpu_flops
-                flop_count_func = flop_registry[func_packet]
-                # We divide by a factor of 2 to get the MACs (multiply and accumulate)
-                flop_count = flop_count_func(*args, **kwargs, out_val=out) / 2
-                # We multiply by 1e9 to get the time in nano seconds
-                compute_time = (flop_count / peak_empirical_flops) * 1e9
-                return compute_time
-            return 0.0
+        Args:
+            func_packet: The operator overload packet.
+            args: The arguments to the operator.
+            kwargs: The keyword arguments to the operator.
+            out: The output of the operator.
+            out_dtypes: The output data types.
 
-        def get_transfer_time(flat_args_kwargs, flat_outs) -> float:  # type: ignore[no-untyped-def]
-            """
-            Estimates the memory transfer time of input and output tensors.
+        Returns:
+            float: The estimated compute time in nanoseconds.
+        """
+        if func_packet in flop_registry:
+            assert (
+                len(out_dtypes) == 1
+            ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
+            dtype = out_dtypes.pop()
+            # This actually gives peta-FLOPs/s hence multiply by 1e15 to get the FLOPs/s
+            peak_gpu_flops = get_device_tflops(dtype) * 1e15
+            # We can expect to achieve 75% of theoretical peak flops
+            factor = 0.75
+            peak_empirical_flops = factor * peak_gpu_flops
+            flop_count_func = flop_registry[func_packet]
+            # We divide by a factor of 2 to get the MACs (multiply and accumulate)
+            flop_count = flop_count_func(*args, **kwargs, out_val=out) / 2
+            # We multiply by 1e9 to get the time in nano seconds
+            compute_time = (flop_count / peak_empirical_flops) * 1e9
+            return compute_time
+        return 0.0
 
-            Args:
-                flat_args_kwargs (List[torch.Tensor]): The flat list of arguments and keyword arguments.
-                flat_outs (List[torch.Tensor]): The flat list of outputs.
+    # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_inductor/scheduler.py#L589  # noqa: PGH004,B950
+    @classmethod
+    def _roofline_estimate(cls, func, args, kwargs) -> Tuple[Any, float]:  # type: ignore[no-untyped-def]
+        """
+        Estimates the runtime of a function using a roofline cost model.
 
-            Returns:
-                float: The estimated memory transfer time in nanoseconds.
-            """
-            gpu_memory_bandwidth = get_gpu_dram_gbps()
-            read_bytes = sum(
-                get_num_bytes(t)
-                for t in flat_args_kwargs
-                if isinstance(t, torch.Tensor)
-            )
-            write_bytes = sum(
-                get_num_bytes(t) for t in flat_outs if isinstance(t, torch.Tensor)
-            )
-            counted_bytes = read_bytes + write_bytes
-            # The GPU memory bandwidth is in GB/s so the transfer time is in nanoseconds
-            transfer_time = counted_bytes / gpu_memory_bandwidth
-            return transfer_time
+        Args:
+            func: The function to estimate.
+            args: The arguments to pass to the function.
+            kwargs: The keyword arguments to pass to the function.
+            out: The output of the function.
+
+        Returns:
+            Tuple[Any, float]: A tuple containing the result of the function and
+                the mean operation time in milliseconds.
+        """
+        assert (
+            torch.cuda.is_available()
+        ), "Roofline estimation needs to access CUDA capabilities to make estimations"
 
         # Roofline Cost Model Explanation
 
@@ -397,7 +434,7 @@ class RuntimeEstimator(TorchDispatchMode):
         if func_packet not in _IGNORE_OPS:
             flat_args_kwargs, args_spec = pytree.tree_flatten((args, kwargs))
             flat_outs, out_spec = pytree.tree_flatten(out)
-            transfer_time = get_transfer_time(flat_args_kwargs, flat_outs)
+            transfer_time = cls._get_transfer_time(flat_args_kwargs, flat_outs)
 
             out_dtypes = {
                 t.dtype
@@ -408,7 +445,320 @@ class RuntimeEstimator(TorchDispatchMode):
             args, kwargs = pytree.tree_unflatten(flat_args_kwargs, args_spec)
             out = pytree.tree_unflatten(flat_outs, out_spec)
 
-            compute_time = get_compute_time(func_packet, args, kwargs, out, out_dtypes)
+            compute_time = cls._get_compute_time(func_packet, args, kwargs, out, out_dtypes)
+            # We get the estimated time as the max of the transfer time and
+            # compute time. We divide by 1e6 to get the time in ms
+            op_time = max(transfer_time, compute_time) / 1e6
+
+        return (out, op_time)
+        
+    @classmethod
+    def _learned_estimate_predictor(cls, func_packet, args, kwargs, out, out_dtypes) -> float:  # type: ignore[no-untyped-def]
+        """
+        TODO:
+            1) the order of the features
+            2) where the models are stored
+        
+        
+        Estimates the compute time of an aten operator.
+
+        Args:
+            func_packet: The operator overload packet.
+            args: The arguments to the operator.
+            kwargs: The keyword arguments to the operator.
+            out: The output of the operator.
+            out_dtypes: The output data types.
+
+        Returns:
+            float: The estimated compute time in nanoseconds.
+            
+        
+        # TODO: comments.
+        Note: for the prediction functions, we mimic the arguments for mm_flop.
+        """
+        def get_learned_model(op: str) -> Any:
+            if op not in _LEARNED_OPS_PREDICTORS:
+                base_dir = os.path.join(os.getcwd())
+                path = os.path.join(base_dir, f"{cls.gpu_type}_models", f"{op}.joblib")
+
+                _LEARNED_OPS_PREDICTORS[op] = joblib.load(path)
+            return _LEARNED_OPS_PREDICTORS[op]
+        
+        
+        from functools import wraps
+        from torch.utils._pytree import tree_map
+        
+        def get_shape(i):
+            if isinstance(i, torch.Tensor):
+                return i.shape
+            return i
+
+        def shape_wrapper(f):
+            """
+            Similar to flop_counter.shape_wrapper(), but also takes takes gflops.
+            """
+            @wraps(f)
+            def nf(dtype, gflops, *args, out_val=None, **kwargs):
+                args, kwargs, out_shape = tree_map(get_shape, (args, kwargs, out_val))
+                return f(dtype, gflops, *args, out_shape=out_shape, **kwargs)
+            return nf
+
+        def register_timing_formula(targets, get_raw=False):
+            """
+            Similar to flop_counter.register_flop_formula().
+            """
+            def register_fun(flop_formula):
+                if not get_raw:
+                    flop_formula = shape_wrapper(flop_formula)
+
+                def register(target):
+                    if not isinstance(target, torch._ops.OpOverloadPacket):
+                        raise ValueError(
+                            f"register_flop_formula(targets): expected each target to be "
+                            f"OpOverloadPacket (i.e. torch.ops.mylib.foo), got "
+                            f"{target} which is of type {type(target)}")
+                    if target in flop_registry:
+                        raise RuntimeError(f"duplicate registrations for {target}")
+                    flop_registry[target] = flop_formula
+
+                # To handle allowing multiple aten_ops at once
+                torch.utils._pytree.tree_map_(register, targets)
+
+                return flop_formula
+
+            return register_fun
+        
+        
+        def convert_dtype(dtype) -> list[int]:
+            """
+            To use dtype in a learned model, we convert them to one-hot encodings.
+            
+            Learned model supports the dtypes:
+                - torch.float16
+                - torch.float32
+                - torch.bfloat16
+            """
+            dtypes = [torch.float16, torch.float32, torch.bfloat16]
+            return [1 if dtype == d else 0 for d in dtypes]
+        
+        @register_timing_formula([aten.mm, aten.addmm])
+        def mm_time(dtype, gflops, a_shape, b_shape, *args, out_shape=None, **kwargs) -> float:
+            model = get_learned_model("mm")
+            
+            m, n = a_shape
+            n2, p = b_shape
+            assert n == n2
+            
+            features = np.array([[m, n, p, gflops] + convert_dtype(dtype)])
+            return model.predict(features)
+            
+        @register_timing_formula([aten.bmm, aten.baddmm])
+        def bmm_time(dtype, gflops, a_shape, b_shape, out_shape=None, **kwargs) -> float:
+            model = get_learned_model("bmm")
+            
+            b, m, n = a_shape
+            b2, n2, p = b_shape
+            assert b == b2 and n == n2
+            
+            features = np.array([[b, m, n, p, gflops] + convert_dtype(dtype)])
+            return model.predict(features)
+
+        def is_causal_sdpa(args: tuple) -> bool:
+            """
+            TODO: the way that flop_counter implements sdpa args/kwargs—namely, `is_causal`—should be updated.
+            This is a heuristic hackaround.
+            """
+            if len(args) >= 2:
+                if args[0] is not None:
+                    return True
+            elif len(args) > 2:
+                if isinstance(args[-1], bool):
+                    return args[-1]
+            return False
+
+        @register_timing_formula(aten._scaled_dot_product_cudnn_attention)
+        def sdpa_cudnn_time(dtype, gflops, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+            model = get_learned_model("sdpa")
+
+            b, h, s_q, d_qk = query_shape
+            _b2, _h2, s_kv, _d2 = key_shape
+            _b3, _h3, _s3, d_v = value_shape
+            assert b == _b2 == _b3 and h == _h2 == _h3 and d_qk == _d2 and s_kv == _s3 and d_qk == _d2
+
+            backends_ohe = [1, 0, 0]
+            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
+            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
+            return model.predict(features)
+
+        @register_timing_formula(aten._scaled_dot_product_efficient_attention)
+        def sdpa_efficient_time(dtype, gflops, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+            model = get_learned_model("sdpa")
+
+            b, h, s_q, d_qk = query_shape
+            _b2, _h2, s_kv, _d2 = key_shape
+            _b3, _h3, _s3, d_v = value_shape
+            assert b == _b2 == _b3 and h == _h2 == _h3 and d_qk == _d2 and s_kv == _s3 and d_qk == _d2
+
+            backends_ohe = [0, 1, 0]
+            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
+            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
+            return model.predict(features)
+        
+        @register_timing_formula(aten._scaled_dot_product_flash_attention)
+        def sdpa_flash_time(dtype, gflops, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+            model = get_learned_model("sdpa")
+
+            b, h, s_q, d_qk = query_shape
+            _b2, _h2, s_kv, _d2 = key_shape
+            _b3, _h3, _s3, d_v = value_shape
+            assert b == _b2 == _b3 and h == _h2 == _h3 and d_qk == _d2 and s_kv == _s3 and d_qk == _d2
+
+            backends_ohe = [0, 0, 1]
+            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
+            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
+            return model.predict(features)
+
+        @register_timing_formula(aten._scaled_dot_product_cudnn_attention_backward)
+        def sdpa_backward_cudnn_time(dtype, gflops, grad_out_shape, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+            model = get_learned_model("sdpa_backward")
+
+            b, h, s_q, d_qk = query_shape
+            _b2, _h2, s_kv, _d2 = key_shape
+            _b3, _h3, _s3, d_v = value_shape
+            _b4, _h4, _s4, _d4 = grad_out_shape
+            assert b == _b2 == _b3 == _b4 and h == _h2 == _h3 == _h4 and d_qk == _d2
+            assert d_v == _d4 and s_kv == _s3 and s_q == _s4
+            
+            backends_ohe = [1, 0, 0]
+            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
+            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
+            return model.predict(features)
+
+        @register_timing_formula(aten._scaled_dot_product_efficient_attention_backward)
+        def sdpa_backward_efficient_time(dtype, gflops, grad_out_shape, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+            model = get_learned_model("sdpa_backward")
+
+            b, h, s_q, d_qk = query_shape
+            _b2, _h2, s_kv, _d2 = key_shape
+            _b3, _h3, _s3, d_v = value_shape
+            _b4, _h4, _s4, _d4 = grad_out_shape
+            assert b == _b2 == _b3 == _b4 and h == _h2 == _h3 == _h4 and d_qk == _d2
+            assert d_v == _d4 and s_kv == _s3 and s_q == _s4
+            
+            backends_ohe = [0, 1, 0]
+            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
+            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
+            return model.predict(features)
+
+        @register_timing_formula(aten._scaled_dot_product_flash_attention_backward)
+        def sdpa_backward_flash_time(dtype, gflops, grad_out_shape, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+            model = get_learned_model("sdpa_backward")
+
+            b, h, s_q, d_qk = query_shape
+            _b2, _h2, s_kv, _d2 = key_shape
+            _b3, _h3, _s3, d_v = value_shape
+            _b4, _h4, _s4, _d4 = grad_out_shape
+            assert b == _b2 == _b3 == _b4 and h == _h2 == _h3 == _h4 and d_qk == _d2
+            assert d_v == _d4 and s_kv == _s3 and s_q == _s4
+            
+            backends_ohe = [0, 0, 1]
+            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
+            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
+            return model.predict(features)
+
+        # @register_timing_formula([aten.convolution, aten._convolution])
+        # def conv_time(dtype, gflops, x_shape, w_shape, _bias, _stride, _padding, _dilation, transposed, *args, out_shape=None, **kwargs) -> float:
+        #     """
+        #     TODO: need to add support for higher dims.
+        #     """
+        #     model = get_learned_model("conv")
+
+        #     # batch_size = x_shape[0]
+        #     # conv_shape = (x_shape if transposed else out_shape)[2:]
+        #     # c_out, c_in, *filter_size = w_shape
+
+        #     # features = np.array([[b, m, k, n, gflops]])
+        #     return model.predict(features)
+        
+        # @register_timing_formula(aten.convolution_backward)
+        # def conv_backward_time(
+        #     dtype,
+        #     gflops,
+        #     grad_out_shape,
+        #     x_shape,
+        #     w_shape,
+        #     _bias,
+        #     _stride,
+        #     _padding,
+        #     _dilation,
+        #     transposed,
+        #     _output_padding,
+        #     _groups,
+        #     output_mask,
+        #     out_shape) -> float:
+        #     """
+        #     TODO: need to add support for higher dims.
+        #     """
+        #     model = get_learned_model("conv_backward")
+
+        #     # features = np.array([[b, m, k, n, gflops]])
+        #     return model.predict(features)
+
+        if func_packet in _LEARNED_OPS:
+            assert (
+                len(out_dtypes) == 1
+            ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
+            dtype = out_dtypes.pop()
+            
+            flop_count_func = flop_registry[func_packet]
+            gflops = flop_count_func(*args, **kwargs, out_val=out) / 1e9
+            
+            predictor_func = _LEARNED_OPS[func_packet]
+            # Returns compute time in ms, so multiply by 1e6 to get nanoseconds
+            compute_time = predictor_func(dtype, gflops, *args, **kwargs, out_val=out)
+            compute_time *= 1e6
+        else:
+            compute_time = cls._get_compute_time(func_packet, args, kwargs, out, out_dtypes)
+        return 0.0
+    
+    @classmethod
+    def _learned_estimate(cls, func, args, kwargs) -> Tuple[Any, float]:  # type: ignore[no-untyped-def]
+        """
+        Estimates the runtime of a function using a learned estimator.
+
+        Args:
+            func: The function to estimate.
+            args: The arguments to pass to the function.
+            kwargs: The keyword arguments to pass to the function.
+            res: The result of the function.
+
+        Returns:
+            Tuple[Any, float]: A tuple containing the result of the function and
+                the mean operation time in milliseconds.
+        """
+        assert (
+            torch.cuda.is_available()
+        ), "Learned estimator needs to access CUDA capabilities to make estimations"
+        
+        kwargs = kwargs if kwargs else {}
+        out = func(*args, **kwargs)
+        op_time = 0.0
+        func_packet = func._overloadpacket
+        if func_packet not in _IGNORE_OPS:
+            flat_args_kwargs, args_spec = pytree.tree_flatten((args, kwargs))
+            flat_outs, out_spec = pytree.tree_flatten(out)
+            transfer_time = cls._get_transfer_time(flat_args_kwargs, flat_outs)
+
+            out_dtypes = {
+                t.dtype
+                for t in flat_outs
+                if isinstance(t, torch.Tensor) and t.dtype in cls._float_types
+            }
+
+            args, kwargs = pytree.tree_unflatten(flat_args_kwargs, args_spec)
+            out = pytree.tree_unflatten(flat_outs, out_spec)
+            
+            compute_time = cls._learned_estimate_predictor(func_packet, args, kwargs, out, out_dtypes)
             # We get the estimated time as the max of the transfer time and
             # compute time. We divide by 1e6 to get the time in ms
             op_time = max(transfer_time, compute_time) / 1e6
