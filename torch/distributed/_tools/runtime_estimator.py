@@ -4,6 +4,7 @@ import os
 import joblib
 import subprocess
 import numpy as np
+import pandas as pd
 import time
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Set, Tuple
@@ -87,6 +88,262 @@ _LEARNED_OPS_PREDICTORS: Dict[str, Any] = {}
 __all__ = ["RuntimeEstimator"]
 
 
+def get_learned_model(op: str, gpu_type: str) -> Any:
+    if op not in _LEARNED_OPS_PREDICTORS:
+        base_dir = os.path.dirname(os.path.realpath(__file__))
+        path = os.path.join(base_dir, f"{gpu_type}_models", f"{op}.joblib")
+
+        _LEARNED_OPS_PREDICTORS[op] = joblib.load(path)
+    return _LEARNED_OPS_PREDICTORS[op]
+
+from functools import wraps
+from torch.utils._pytree import tree_map
+
+def get_shape(i):
+    if isinstance(i, torch.Tensor):
+        return i.shape
+    return i
+
+def shape_wrapper(f):
+    """
+    Similar to flop_counter.shape_wrapper(), but also takes takes gflops.
+    """
+    @wraps(f)
+    def nf(gpu_type, dtype, gflops, *args, out_val=None, **kwargs):
+        args, kwargs, out_shape = tree_map(get_shape, (args, kwargs, out_val))
+        return f(gpu_type, dtype, gflops, *args, out_shape=out_shape, **kwargs)
+    return nf
+
+def register_timing_formula(targets, get_raw=False):
+    """
+    Similar to flop_counter.register_flop_formula().
+    """
+    def register_fun(time_formula):
+        if not get_raw:
+            time_formula = shape_wrapper(time_formula)
+
+        def register(target):
+            if not isinstance(target, torch._ops.OpOverloadPacket):
+                raise ValueError(
+                    f"register_flop_formula(targets): expected each target to be "
+                    f"OpOverloadPacket (i.e. torch.ops.mylib.foo), got "
+                    f"{target} which is of type {type(target)}")
+            if target in _LEARNED_OPS:
+                raise RuntimeError(f"duplicate registrations for {target}")
+            _LEARNED_OPS[target] = time_formula
+
+        # To handle allowing multiple aten_ops at once
+        torch.utils._pytree.tree_map_(register, targets)
+
+        return time_formula
+
+    return register_fun
+
+def convert_dtype(dtype) -> Dict[str, int]:
+    """
+    Convert dtype to a one-hot encoding as a pandas Series.
+    
+    Learned model supports the dtypes:
+        - torch.float16
+        - torch.float32
+        - torch.bfloat16
+    """
+    dtypes = [torch.float16, torch.float32, torch.bfloat16]
+    dtype_one_hot = [1 if dtype == d else 0 for d in dtypes]
+    dtype_names = ["dtype_16", "dtype_32", "dtype_b16"]
+    return dict(zip(dtype_names, dtype_one_hot))
+
+@register_timing_formula(aten.mm)
+def mm_time(gpu_type, dtype, gflops, a_shape, b_shape, *args, out_shape=None, **kwargs) -> float:
+    model = get_learned_model("mm", gpu_type)
+
+    m, n = a_shape
+    n2, p = b_shape
+    assert n == n2
+
+    dtypes = convert_dtype(dtype)
+    features = {
+        "n": n,
+        "m": m,
+        "p": p,
+        "gflops": gflops,
+        "dtype_16": dtypes["dtype_16"],
+        "dtype_32": dtypes["dtype_32"],
+        "dtype_b16": dtypes["dtype_b16"],
+    }
+    features_df = pd.DataFrame([features])
+    return float(model.predict(features_df)[0])
+
+@register_timing_formula(aten.addmm)
+def addmm_time(gpu_type, dtype, gflops, self_shape, a_shape, b_shape, out_shape=None, **kwargs) -> float:
+    return mm_time(gpu_type, dtype, gflops, a_shape, b_shape)
+
+@register_timing_formula(aten.bmm)
+def bmm_time(gpu_type, dtype, gflops, a_shape, b_shape, out_shape=None, **kwargs) -> float:
+    model = get_learned_model("bmm", gpu_type)
+
+    b, m, n = a_shape
+    b2, n2, p = b_shape
+    assert b == b2 and n == n2
+    
+    dtypes = convert_dtype(dtype)
+    features = {
+        "b": b,
+        "n": n,
+        "m": m,
+        "p": p,
+        "gflops": gflops,
+        "dtype_16": dtypes["dtype_16"],
+        "dtype_32": dtypes["dtype_32"],
+        "dtype_b16": dtypes["dtype_b16"],
+    }
+    features_df = pd.DataFrame([features])
+    return float(model.predict(features_df)[0])
+
+@register_timing_formula(aten.baddbmm)
+def baddbmm_time(gpu_type, dtype, gflops, self_shape, a_shape, b_shape, out_shape=None, **kwargs) -> float:
+    return bmm_time(gpu_type, dtype, gflops, a_shape, b_shape)
+
+def is_causal_sdpa(args: tuple) -> bool:
+    """
+    TODO: the way that flop_counter implements sdpa args/kwargs—namely, `is_causal`—should be updated.
+    This is a heuristic hackaround.
+    """
+    if len(args) >= 2 and args[0] is not None:
+        return True
+    if len(args) > 2 and isinstance(args[-1], bool):
+        return args[-1]
+    return False
+
+def build_sdpa_features(b, h, s_q, s_kv, d_qk, d_v, gflops, dtype, backend, is_causal: bool) -> pd.DataFrame:
+    if backend == "cudnn":
+        backends_ohe = [1, 0, 0]
+    elif backend == "efficient":
+        backends_ohe = [0, 1, 0]
+    elif backend == "flash":
+        backends_ohe = [0, 0, 1]
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
+
+    dtypes = convert_dtype(dtype)
+    is_causal_ohe = [0, 1] if is_causal else [1, 0]
+
+    features = {
+        "b": b,
+        "h": h,
+        "s_q": s_q,
+        "s_kv": s_kv,
+        "d_qk": d_qk,
+        "d_v": d_v,
+        "gflops": gflops,
+        "dtype_16": dtypes["dtype_16"],
+        "dtype_32": dtypes["dtype_32"],
+        "dtype_b16": dtypes["dtype_b16"],
+        "backend_cudnn": backends_ohe[0],
+        "backend_efficient": backends_ohe[1],
+        "backend_flash": backends_ohe[2],
+        "is_causal_0": is_causal_ohe[0],
+        "is_causal_1": is_causal_ohe[1]
+    }
+    return pd.DataFrame([features])
+
+
+def check_sdpa_shapes(query_shape, key_shape, value_shape):
+    b, h, s_q, d_qk = query_shape
+    _b2, _h2, s_kv, _d2 = key_shape
+    _b3, _h3, _s3, d_v = value_shape
+    assert b == _b2 == _b3 and h == _h2 == _h3 and d_qk == _d2 and s_kv == _s3 and d_qk == _d2
+    return b, h, s_q, s_kv, d_qk, d_v
+
+def check_sdpa_shapes_backward(query_shape, key_shape, value_shape, grad_out_shape):
+    b, h, s_q, d_qk = query_shape
+    _b2, _h2, s_kv, _d2 = key_shape
+    _b3, _h3, _s3, d_v = value_shape
+    _b4, _h4, _s4, _d4 = grad_out_shape
+    assert b == _b2 == _b3 == _b4 and h == _h2 == _h3 == _h4 and d_qk == _d2 and d_v == _d4 and s_kv == _s3 and s_q == _s4
+    return b, h, s_q, s_kv, d_qk, d_v
+
+@register_timing_formula(aten._scaled_dot_product_cudnn_attention)
+def sdpa_cudnn_time(gpu_type, dtype, gflops, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+    model = get_learned_model("sdpa", gpu_type)
+    b, h, s_q, s_kv, d_qk, d_v = check_sdpa_shapes(query_shape, key_shape, value_shape)
+    features = build_sdpa_features(b, h, s_q, s_kv, d_qk, d_v, gflops, dtype, "cudnn", is_causal=is_causal_sdpa(args))
+    return float(model.predict(features)[0])
+
+@register_timing_formula(aten._scaled_dot_product_efficient_attention)
+def sdpa_efficient_time(gpu_type, dtype, gflops, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+    model = get_learned_model("sdpa", gpu_type)
+    b, h, s_q, s_kv, d_qk, d_v = check_sdpa_shapes(query_shape, key_shape, value_shape)
+    features = build_sdpa_features(b, h, s_q, s_kv, d_qk, d_v, gflops, dtype, "efficient", is_causal=is_causal_sdpa(args))
+    return float(model.predict(features)[0])
+
+@register_timing_formula(aten._scaled_dot_product_flash_attention)
+def sdpa_flash_time(gpu_type, dtype, gflops, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+    model = get_learned_model("sdpa", gpu_type)
+    b, h, s_q, s_kv, d_qk, d_v = check_sdpa_shapes(query_shape, key_shape, value_shape)
+    features = build_sdpa_features(b, h, s_q, s_kv, d_qk, d_v, gflops, dtype, "flash", is_causal=is_causal_sdpa(args))
+    return float(model.predict(features)[0])
+
+@register_timing_formula(aten._scaled_dot_product_cudnn_attention_backward)
+def sdpa_backward_cudnn_time(gpu_type, dtype, gflops, grad_out_shape, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+    model = get_learned_model("sdpa_backward", gpu_type)
+    b, h, s_q, s_kv, d_qk, d_v = check_sdpa_shapes_backward(query_shape, key_shape, value_shape, grad_out_shape)
+    features = build_sdpa_features(b, h, s_q, s_kv, d_qk, d_v, gflops, dtype, "cudnn", is_causal=is_causal_sdpa(args))
+    return float(model.predict(features)[0])
+
+@register_timing_formula(aten._scaled_dot_product_efficient_attention_backward)
+def sdpa_backward_efficient_time(gpu_type, dtype, gflops, grad_out_shape, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+    model = get_learned_model("sdpa_backward", gpu_type)
+    b, h, s_q, s_kv, d_qk, d_v = check_sdpa_shapes_backward(query_shape, key_shape, value_shape, grad_out_shape)
+    features = build_sdpa_features(b, h, s_q, s_kv, d_qk, d_v, gflops, dtype, "efficient", is_causal=is_causal_sdpa(args))
+    return float(model.predict(features)[0])
+
+@register_timing_formula(aten._scaled_dot_product_flash_attention_backward)
+def sdpa_backward_flash_time(gpu_type, dtype, gflops, grad_out_shape, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
+    model = get_learned_model("sdpa_backward", gpu_type)
+    b, h, s_q, s_kv, d_qk, d_v = check_sdpa_shapes_backward(query_shape, key_shape, value_shape, grad_out_shape)
+    features = build_sdpa_features(b, h, s_q, s_kv, d_qk, d_v, gflops, dtype, "flash", is_causal=is_causal_sdpa(args))
+    return float(model.predict(features)[0])
+
+# @register_timing_formula([aten.convolution, aten._convolution])
+# def conv_time(gpu_type, dtype, gflops, x_shape, w_shape, _bias, _stride, _padding, _dilation, transposed, *args, out_shape=None, **kwargs) -> float:
+#     """
+#     TODO: need to add support for higher dims.
+#     """
+#     model = get_learned_model("conv", gpu_type)
+
+#     # batch_size = x_shape[0]
+#     # conv_shape = (x_shape if transposed else out_shape)[2:]
+#     # c_out, c_in, *filter_size = w_shape
+
+#     # features = np.array([[b, m, k, n, gflops]])
+#     return model.predict(features)
+
+# @register_timing_formula(aten.convolution_backward)
+# def conv_backward_time(
+#     gpu_type,
+#     dtype,
+#     gflops,
+#     grad_out_shape,
+#     x_shape,
+#     w_shape,
+#     _bias,
+#     _stride,
+#     _padding,
+#     _dilation,
+#     transposed,
+#     _output_padding,
+#     _groups,
+#     output_mask,
+#     out_shape) -> float:
+#     """
+#     TODO: need to add support for higher dims.
+#     """
+#     model = get_learned_model("conv_backward", gpu_type)
+
+#     # features = np.array([[b, m, k, n, gflops]])
+#     return model.predict(features)
+
 class RuntimeEstimator(TorchDispatchMode):
     """
     Estimates the GPU runtime in milliseconds using various estimation methods under the ``FakeTensorMode``.
@@ -141,6 +398,9 @@ class RuntimeEstimator(TorchDispatchMode):
     _no_fallback_kernel: Set[torch._ops._OpNamespace] = set()
     fake_mode: FakeTensorMode
 
+    gpu_types: Dict[int, str] = {}
+    count = {}
+
     def __init__(self) -> None:
         super().__init__()
         self._estimate: Callable
@@ -155,7 +415,10 @@ class RuntimeEstimator(TorchDispatchMode):
         self.mod_bw_post_order: List[str] = []
         self.total_runtime: float = 0.0
 
-        self.gpu_type = self.get_device_type()
+        gpu_id = torch.cuda.current_device()  # Get the current GPU ID
+        if gpu_id not in RuntimeEstimator.gpu_types:
+            RuntimeEstimator.gpu_types[gpu_id] = self.get_device_type()  # Initialize gpu_type for the GPU
+        self.gpu_type = RuntimeEstimator.gpu_types[gpu_id]  # Assign gpu_type based on the current GPU
 
     def get_device_type(self) -> int:
         try:
@@ -470,256 +733,26 @@ class RuntimeEstimator(TorchDispatchMode):
             out_dtypes: The output data types.
 
         Returns:
-            float: The estimated compute time in nanoseconds.
+            float: The estimated compute time in milliseconds.
             
         
         # TODO: comments.
         Note: for the prediction functions, we mimic the arguments for mm_flop.
         """
-        def get_learned_model(op: str) -> Any:
-            if op not in _LEARNED_OPS_PREDICTORS:
-                base_dir = os.path.join(os.getcwd())
-                path = os.path.join(base_dir, f"{cls.gpu_type}_models", f"{op}.joblib")
-
-                _LEARNED_OPS_PREDICTORS[op] = joblib.load(path)
-            return _LEARNED_OPS_PREDICTORS[op]
-        
-        
-        from functools import wraps
-        from torch.utils._pytree import tree_map
-        
-        def get_shape(i):
-            if isinstance(i, torch.Tensor):
-                return i.shape
-            return i
-
-        def shape_wrapper(f):
-            """
-            Similar to flop_counter.shape_wrapper(), but also takes takes gflops.
-            """
-            @wraps(f)
-            def nf(dtype, gflops, *args, out_val=None, **kwargs):
-                args, kwargs, out_shape = tree_map(get_shape, (args, kwargs, out_val))
-                return f(dtype, gflops, *args, out_shape=out_shape, **kwargs)
-            return nf
-
-        def register_timing_formula(targets, get_raw=False):
-            """
-            Similar to flop_counter.register_flop_formula().
-            """
-            def register_fun(flop_formula):
-                if not get_raw:
-                    flop_formula = shape_wrapper(flop_formula)
-
-                def register(target):
-                    if not isinstance(target, torch._ops.OpOverloadPacket):
-                        raise ValueError(
-                            f"register_flop_formula(targets): expected each target to be "
-                            f"OpOverloadPacket (i.e. torch.ops.mylib.foo), got "
-                            f"{target} which is of type {type(target)}")
-                    if target in flop_registry:
-                        raise RuntimeError(f"duplicate registrations for {target}")
-                    flop_registry[target] = flop_formula
-
-                # To handle allowing multiple aten_ops at once
-                torch.utils._pytree.tree_map_(register, targets)
-
-                return flop_formula
-
-            return register_fun
-        
-        
-        def convert_dtype(dtype) -> list[int]:
-            """
-            To use dtype in a learned model, we convert them to one-hot encodings.
-            
-            Learned model supports the dtypes:
-                - torch.float16
-                - torch.float32
-                - torch.bfloat16
-            """
-            dtypes = [torch.float16, torch.float32, torch.bfloat16]
-            return [1 if dtype == d else 0 for d in dtypes]
-        
-        @register_timing_formula([aten.mm, aten.addmm])
-        def mm_time(dtype, gflops, a_shape, b_shape, *args, out_shape=None, **kwargs) -> float:
-            model = get_learned_model("mm")
-            
-            m, n = a_shape
-            n2, p = b_shape
-            assert n == n2
-            
-            features = np.array([[m, n, p, gflops] + convert_dtype(dtype)])
-            return model.predict(features)
-            
-        @register_timing_formula([aten.bmm, aten.baddmm])
-        def bmm_time(dtype, gflops, a_shape, b_shape, out_shape=None, **kwargs) -> float:
-            model = get_learned_model("bmm")
-            
-            b, m, n = a_shape
-            b2, n2, p = b_shape
-            assert b == b2 and n == n2
-            
-            features = np.array([[b, m, n, p, gflops] + convert_dtype(dtype)])
-            return model.predict(features)
-
-        def is_causal_sdpa(args: tuple) -> bool:
-            """
-            TODO: the way that flop_counter implements sdpa args/kwargs—namely, `is_causal`—should be updated.
-            This is a heuristic hackaround.
-            """
-            if len(args) >= 2:
-                if args[0] is not None:
-                    return True
-            elif len(args) > 2:
-                if isinstance(args[-1], bool):
-                    return args[-1]
-            return False
-
-        @register_timing_formula(aten._scaled_dot_product_cudnn_attention)
-        def sdpa_cudnn_time(dtype, gflops, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
-            model = get_learned_model("sdpa")
-
-            b, h, s_q, d_qk = query_shape
-            _b2, _h2, s_kv, _d2 = key_shape
-            _b3, _h3, _s3, d_v = value_shape
-            assert b == _b2 == _b3 and h == _h2 == _h3 and d_qk == _d2 and s_kv == _s3 and d_qk == _d2
-
-            backends_ohe = [1, 0, 0]
-            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
-            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
-            return model.predict(features)
-
-        @register_timing_formula(aten._scaled_dot_product_efficient_attention)
-        def sdpa_efficient_time(dtype, gflops, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
-            model = get_learned_model("sdpa")
-
-            b, h, s_q, d_qk = query_shape
-            _b2, _h2, s_kv, _d2 = key_shape
-            _b3, _h3, _s3, d_v = value_shape
-            assert b == _b2 == _b3 and h == _h2 == _h3 and d_qk == _d2 and s_kv == _s3 and d_qk == _d2
-
-            backends_ohe = [0, 1, 0]
-            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
-            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
-            return model.predict(features)
-        
-        @register_timing_formula(aten._scaled_dot_product_flash_attention)
-        def sdpa_flash_time(dtype, gflops, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
-            model = get_learned_model("sdpa")
-
-            b, h, s_q, d_qk = query_shape
-            _b2, _h2, s_kv, _d2 = key_shape
-            _b3, _h3, _s3, d_v = value_shape
-            assert b == _b2 == _b3 and h == _h2 == _h3 and d_qk == _d2 and s_kv == _s3 and d_qk == _d2
-
-            backends_ohe = [0, 0, 1]
-            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
-            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
-            return model.predict(features)
-
-        @register_timing_formula(aten._scaled_dot_product_cudnn_attention_backward)
-        def sdpa_backward_cudnn_time(dtype, gflops, grad_out_shape, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
-            model = get_learned_model("sdpa_backward")
-
-            b, h, s_q, d_qk = query_shape
-            _b2, _h2, s_kv, _d2 = key_shape
-            _b3, _h3, _s3, d_v = value_shape
-            _b4, _h4, _s4, _d4 = grad_out_shape
-            assert b == _b2 == _b3 == _b4 and h == _h2 == _h3 == _h4 and d_qk == _d2
-            assert d_v == _d4 and s_kv == _s3 and s_q == _s4
-            
-            backends_ohe = [1, 0, 0]
-            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
-            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
-            return model.predict(features)
-
-        @register_timing_formula(aten._scaled_dot_product_efficient_attention_backward)
-        def sdpa_backward_efficient_time(dtype, gflops, grad_out_shape, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
-            model = get_learned_model("sdpa_backward")
-
-            b, h, s_q, d_qk = query_shape
-            _b2, _h2, s_kv, _d2 = key_shape
-            _b3, _h3, _s3, d_v = value_shape
-            _b4, _h4, _s4, _d4 = grad_out_shape
-            assert b == _b2 == _b3 == _b4 and h == _h2 == _h3 == _h4 and d_qk == _d2
-            assert d_v == _d4 and s_kv == _s3 and s_q == _s4
-            
-            backends_ohe = [0, 1, 0]
-            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
-            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
-            return model.predict(features)
-
-        @register_timing_formula(aten._scaled_dot_product_flash_attention_backward)
-        def sdpa_backward_flash_time(dtype, gflops, grad_out_shape, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> float:
-            model = get_learned_model("sdpa_backward")
-
-            b, h, s_q, d_qk = query_shape
-            _b2, _h2, s_kv, _d2 = key_shape
-            _b3, _h3, _s3, d_v = value_shape
-            _b4, _h4, _s4, _d4 = grad_out_shape
-            assert b == _b2 == _b3 == _b4 and h == _h2 == _h3 == _h4 and d_qk == _d2
-            assert d_v == _d4 and s_kv == _s3 and s_q == _s4
-            
-            backends_ohe = [0, 0, 1]
-            is_causal_ohe = [0, 1] if is_causal_sdpa(args) else [1, 0]
-            features = np.array([[b, h, s_q, s_kv, d_qk, d_v, gflops] + convert_dtype(dtype) + backends_ohe + is_causal_ohe])
-            return model.predict(features)
-
-        # @register_timing_formula([aten.convolution, aten._convolution])
-        # def conv_time(dtype, gflops, x_shape, w_shape, _bias, _stride, _padding, _dilation, transposed, *args, out_shape=None, **kwargs) -> float:
-        #     """
-        #     TODO: need to add support for higher dims.
-        #     """
-        #     model = get_learned_model("conv")
-
-        #     # batch_size = x_shape[0]
-        #     # conv_shape = (x_shape if transposed else out_shape)[2:]
-        #     # c_out, c_in, *filter_size = w_shape
-
-        #     # features = np.array([[b, m, k, n, gflops]])
-        #     return model.predict(features)
-        
-        # @register_timing_formula(aten.convolution_backward)
-        # def conv_backward_time(
-        #     dtype,
-        #     gflops,
-        #     grad_out_shape,
-        #     x_shape,
-        #     w_shape,
-        #     _bias,
-        #     _stride,
-        #     _padding,
-        #     _dilation,
-        #     transposed,
-        #     _output_padding,
-        #     _groups,
-        #     output_mask,
-        #     out_shape) -> float:
-        #     """
-        #     TODO: need to add support for higher dims.
-        #     """
-        #     model = get_learned_model("conv_backward")
-
-        #     # features = np.array([[b, m, k, n, gflops]])
-        #     return model.predict(features)
-
+        op_time = 0.0
         if func_packet in _LEARNED_OPS:
             assert (
                 len(out_dtypes) == 1
             ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
             dtype = out_dtypes.pop()
-            
+
             flop_count_func = flop_registry[func_packet]
             gflops = flop_count_func(*args, **kwargs, out_val=out) / 1e9
-            
             predictor_func = _LEARNED_OPS[func_packet]
-            # Returns compute time in ms, so multiply by 1e6 to get nanoseconds
-            compute_time = predictor_func(dtype, gflops, *args, **kwargs, out_val=out)
-            compute_time *= 1e6
-        else:
-            compute_time = cls._get_compute_time(func_packet, args, kwargs, out, out_dtypes)
-        return 0.0
+            gpu_id = torch.cuda.current_device()
+            op_time = predictor_func(cls.gpu_types[gpu_id], dtype, gflops, *args, **kwargs, out_val=out)
+            cls.count[func_packet] = cls.count.get(func_packet, 0) + 1
+        return op_time
     
     @classmethod
     def _learned_estimate(cls, func, args, kwargs) -> Tuple[Any, float]:  # type: ignore[no-untyped-def]
@@ -747,7 +780,6 @@ class RuntimeEstimator(TorchDispatchMode):
         if func_packet not in _IGNORE_OPS:
             flat_args_kwargs, args_spec = pytree.tree_flatten((args, kwargs))
             flat_outs, out_spec = pytree.tree_flatten(out)
-            transfer_time = cls._get_transfer_time(flat_args_kwargs, flat_outs)
 
             out_dtypes = {
                 t.dtype
@@ -757,11 +789,17 @@ class RuntimeEstimator(TorchDispatchMode):
 
             args, kwargs = pytree.tree_unflatten(flat_args_kwargs, args_spec)
             out = pytree.tree_unflatten(flat_outs, out_spec)
-            
-            compute_time = cls._learned_estimate_predictor(func_packet, args, kwargs, out, out_dtypes)
-            # We get the estimated time as the max of the transfer time and
-            # compute time. We divide by 1e6 to get the time in ms
-            op_time = max(transfer_time, compute_time) / 1e6
+
+            if func_packet in _LEARNED_OPS:
+                op_time = cls._learned_estimate_predictor(func_packet, args, kwargs, out, out_dtypes)
+            else:
+                # Roofline estimate.
+                transfer_time = cls._get_transfer_time(flat_args_kwargs, flat_outs)
+                compute_time = cls._get_compute_time(func_packet, args, kwargs, out, out_dtypes)
+
+                # We get the estimated time as the max of the transfer time and
+                # compute time. We divide by 1e6 to get the time in ms
+                op_time = max(transfer_time, compute_time) / 1e6
 
         return (out, op_time)
 
@@ -828,6 +866,8 @@ class RuntimeEstimator(TorchDispatchMode):
             self._estimate = RuntimeEstimator._benchmark_estimate
         elif estimate_mode_type == "operator-level-cost-model":
             self._estimate = RuntimeEstimator._roofline_estimate
+        elif estimate_mode_type == "operator-level-learned-model":
+            self._estimate = RuntimeEstimator._learned_estimate
         else:
             raise NotImplementedError(
                 f"estimate_mode_type {estimate_mode_type} not supported"
@@ -870,6 +910,7 @@ class RuntimeEstimator(TorchDispatchMode):
             f"Estimated ({self._estimate_mode_type})"
             f"total_time: {self.total_runtime:.3f} ms"
         )
+        print("count", self.count)
         if len(self._no_fallback_kernel) > 0:
             print("no_fallback_kernel: ", list(self._no_fallback_kernel))
         super().__exit__(*args)
