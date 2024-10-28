@@ -5,3 +5,11 @@
 .github/scripts/gql_mocks.json linguist-generated=true
 third_party/LICENSES_BUNDLED.txt linguist-generated=true
 tools/build/bazel/requirements.txt linguist-generated=true
+torch/distributed/_tools/a100_models/bmm.joblib filter=lfs diff=lfs merge=lfs -text
+torch/distributed/_tools/a100_models/mm.joblib filter=lfs diff=lfs merge=lfs -text
+torch/distributed/_tools/a100_models/sdpa.joblib filter=lfs diff=lfs merge=lfs -text
+torch/distributed/_tools/a100_models/sdpa_backward.joblib filter=lfs diff=lfs merge=lfs -text
+torch/distributed/_tools/h100_models/sdpa.joblib filter=lfs diff=lfs merge=lfs -text
+torch/distributed/_tools/h100_models/sdpa_backward.joblib filter=lfs diff=lfs merge=lfs -text
+torch/distributed/_tools/h100_models/bmm.joblib filter=lfs diff=lfs merge=lfs -text
+torch/distributed/_tools/h100_models/mm.joblib filter=lfs diff=lfs merge=lfs -text

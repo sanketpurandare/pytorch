@@ -133,6 +133,7 @@ class TestRuntimeEstimator(TestCase):
     def test_transformer_runtime(
         self,
     ):
+        print("Transformer Test")
         """Runs a basic GPT-2 model"""
         vocab_size = 8192
         bsz, seq_len = 8, 1024
@@ -155,15 +156,22 @@ class TestRuntimeEstimator(TestCase):
             roofline_estimate = self._runtime_estimate(
                 "operator-level-cost-model", self._train_step, fake_args
             )
+            learned_estimate = self._runtime_estimate(
+                "operator-level-learned-model", self._train_step, fake_args
+            )
         benchmark_accuracy = actual_runtime / benchmark_estimate
         roofline_accuracy = actual_runtime / roofline_estimate
+        learned_accuracy = actual_runtime / learned_estimate
         print(
             f"Actual: {actual_runtime} Benchmark Estimate: {benchmark_estimate} Accuracy: {benchmark_accuracy}"
-            f"\n Actual: {actual_runtime} Roofline Estimatee: {roofline_estimate} Accuracy: {roofline_accuracy}"
+            f"\nActual: {actual_runtime} Roofline Estimate: {roofline_estimate} Accuracy: {roofline_accuracy}"
+            f"\nActual: {actual_runtime} Learned Estimate: {learned_estimate} Accuracy: {learned_accuracy}"
         )
+
         # No accuracy check for benchmark in CI as it is highly variable
         # self.assertAlmostEqual(benchmark_accuracy, 1.0, delta=0.2)
         # self.assertAlmostEqual(roofline_accuracy, 1.0, delta=0.3)
+
 
     @skipIfTorchDynamo("https://github.com/pytorch/pytorch/issues/115653")
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
@@ -171,6 +179,7 @@ class TestRuntimeEstimator(TestCase):
         self,
     ):
         """Runs a simple CNN model"""
+        print("CNN Test")
         num_classes = 100
         bsz, img_sz = 256, 128
         model_args = ConvArgs(img_sz, num_classes)
@@ -184,11 +193,16 @@ class TestRuntimeEstimator(TestCase):
             roofline_estimate = self._runtime_estimate(
                 "operator-level-cost-model", self._train_step, fake_args
             )
+            learned_estimate = self._runtime_estimate(
+                "operator-level-learned-model", self._train_step, fake_args
+            )
         benchmark_accuracy = actual_runtime / benchmark_estimate
         roofline_accuracy = actual_runtime / roofline_estimate
+        learned_accuracy = actual_runtime / learned_estimate
         print(
-            f"Actual: {actual_runtime} Benchmark Estimate: {benchmark_estimate} Accuracy: {benchmark_accuracy}\n"
-            f"Actual: {actual_runtime} Roofline Estimatee: {roofline_estimate} Accuracy: {roofline_accuracy}"
+            f"Actual: {actual_runtime} Benchmark Estimate: {benchmark_estimate} Accuracy: {benchmark_accuracy}"
+            f"\nActual: {actual_runtime} Roofline Estimate: {roofline_estimate} Accuracy: {roofline_accuracy}"
+            f"\nActual: {actual_runtime} Learned Estimate: {learned_estimate} Accuracy: {learned_accuracy}"
         )
         # No accuracy check for benchmark in CI as it is highly variable
         # self.assertAlmostEqual(benchmark_accuracy, 1.0, delta=0.2)
