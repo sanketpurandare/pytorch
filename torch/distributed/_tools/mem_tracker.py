@@ -3,7 +3,7 @@ import os
 import re
 import warnings
 from copy import deepcopy
-from enum import auto, Enum
+from enum import auto, Enum, StrEnum
 from functools import partial, wraps
 from typing import (
     Any,
@@ -47,11 +47,11 @@ _TOTAL_KEY = "Total"
 __all__ = ["MemTracker"]
 
 
-class _RefType(str, Enum):
+class _RefType(StrEnum):
     """Base Class for defining memory reference types, categorizing tensors based on their usage within a model."""
 
 
-class _State(str, Enum):
+class _State(StrEnum):
     """Base Class for defining module state to capture snapshots ."""
 
 

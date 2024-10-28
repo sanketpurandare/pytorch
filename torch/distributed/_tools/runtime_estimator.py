@@ -9,6 +9,7 @@ import time
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Set, Tuple
 from typing_extensions import Self
+from torch.distributed._tools.run_est_utils import get_peak_flops_registry, peak_factors
 
 import torch
 import torch.utils._pytree as pytree
@@ -397,7 +398,8 @@ class RuntimeEstimator(TorchDispatchMode):
     }
     _no_fallback_kernel: Set[torch._ops._OpNamespace] = set()
     fake_mode: FakeTensorMode
-
+    _peak_flops_reg: Dict[torch.dtype, int] = {}
+    _factors: Dict[torch.dtype, float] = {}
     gpu_types: Dict[int, str] = {}
     count = {}
 
@@ -417,10 +419,12 @@ class RuntimeEstimator(TorchDispatchMode):
 
         gpu_id = torch.cuda.current_device()  # Get the current GPU ID
         if gpu_id not in RuntimeEstimator.gpu_types:
-            RuntimeEstimator.gpu_types[gpu_id] = self.get_device_type()  # Initialize gpu_type for the GPU
+            RuntimeEstimator.gpu_types[gpu_id] = RuntimeEstimator.get_device_type()  # Initialize gpu_type for the GPU
         self.gpu_type = RuntimeEstimator.gpu_types[gpu_id]  # Assign gpu_type based on the current GPU
-
-    def get_device_type(self) -> int:
+        RuntimeEstimator._factors = peak_factors[self.gpu_type]
+    
+    @classmethod
+    def get_device_type(cls) -> str:
         try:
             result = subprocess.check_output(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'])
             gpu_name = result.decode('utf-8').strip()
@@ -629,15 +633,20 @@ class RuntimeEstimator(TorchDispatchMode):
             float: The estimated compute time in nanoseconds.
         """
         if func_packet in flop_registry:
-            assert (
-                len(out_dtypes) == 1
-            ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
-            dtype = out_dtypes.pop()
-            # This actually gives peta-FLOPs/s hence multiply by 1e15 to get the FLOPs/s
-            peak_gpu_flops = get_device_tflops(dtype) * 1e15
-            # We can expect to achieve 75% of theoretical peak flops
-            factor = 0.75
-            peak_empirical_flops = factor * peak_gpu_flops
+            # assert (
+            #     len(out_dtypes) == 1
+            # ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
+            # dtype = out_dtypes.pop()
+            float_dtypes = out_dtypes & cls._float_types
+            dtype = min(float_dtypes, key=lambda x: x.itemsize)
+            if dtype == torch.float32:
+                print(func_packet, dtype)
+                print([arg.dtype for arg in args])
+            if len (cls._peak_flops_reg) == 0:
+                cls._peak_flops_reg = get_peak_flops_registry(cls.get_device_type().upper())
+            
+            peak_gpu_flops = cls._peak_flops_reg[dtype]
+            peak_empirical_flops = cls._factors[dtype] * peak_gpu_flops
             flop_count_func = flop_registry[func_packet]
             # We divide by a factor of 2 to get the MACs (multiply and accumulate)
             flop_count = flop_count_func(*args, **kwargs, out_val=out) / 2
