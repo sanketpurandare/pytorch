@@ -906,10 +906,10 @@ class RuntimeEstimator(TorchDispatchMode):
                 self._mod_tracker.get_known_fqn(mod)
             ),
             post_fw_hook=lambda mod, inp, out: self.mod_fw_post_order.append(
-                self._mod_tracker.get_known_fqn(mod)
+                self._mod_tracker.get_known_fqn(mod) if mod is not None else ""
             ),
             post_bw_hook=lambda mod, g_inp: self.mod_bw_post_order.append(
-                self._mod_tracker.get_known_fqn(mod)
+                self._mod_tracker.get_known_fqn(mod) if mod is not None else ""
             ),
         )
         self._mod_tracker.__enter__()
