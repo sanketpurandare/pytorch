@@ -75,6 +75,7 @@ _CREATE_OPS = {
     aten.arange,
     aten.ones_like,
     aten.zeros_like,
+    aten.as_strided_,
 }
 
 _IGNORE_OPS = _VIEW_OPS | _CREATE_OPS
@@ -422,6 +423,8 @@ class RuntimeEstimator(TorchDispatchMode):
             RuntimeEstimator.gpu_types[gpu_id] = RuntimeEstimator.get_device_type()  # Initialize gpu_type for the GPU
         self.gpu_type = RuntimeEstimator.gpu_types[gpu_id]  # Assign gpu_type based on the current GPU
         RuntimeEstimator._factors = peak_factors[self.gpu_type]
+        print(self.gpu_type)
+        print(RuntimeEstimator._factors)
     
     @classmethod
     def get_device_type(cls) -> str:
@@ -553,7 +556,7 @@ class RuntimeEstimator(TorchDispatchMode):
             cls.fake_mode, FakeTensorMode
         ), "Initialize/Assign FakeTensorMode before using this function"
         mean_op_time = 0.0
-        if func._overloadpacket not in _VIEW_OPS:
+        if func._overloadpacket not in _IGNORE_OPS:
             try:
                 res, mean_op_time = cls._maybe_run_and_benchmark_fallback_kernel(
                     func,
@@ -615,7 +618,7 @@ class RuntimeEstimator(TorchDispatchMode):
         counted_bytes = read_bytes + write_bytes
         # The GPU memory bandwidth is in GB/s so the transfer time is in nanoseconds
         transfer_time = counted_bytes / gpu_memory_bandwidth
-        return transfer_time
+        return transfer_time / 2.5
 
     @classmethod
     def _get_compute_time(cls, func_packet, args, kwargs, out, out_dtypes) -> float:  # type: ignore[no-untyped-def]
@@ -639,10 +642,7 @@ class RuntimeEstimator(TorchDispatchMode):
             # dtype = out_dtypes.pop()
             float_dtypes = out_dtypes & cls._float_types
             dtype = min(float_dtypes, key=lambda x: x.itemsize)
-            if dtype == torch.float32:
-                print(func_packet, dtype)
-                print([arg.dtype for arg in args])
-            if len (cls._peak_flops_reg) == 0:
+            if len(cls._peak_flops_reg) == 0:
                 cls._peak_flops_reg = get_peak_flops_registry(cls.get_device_type().upper())
             
             peak_gpu_flops = cls._peak_flops_reg[dtype]
@@ -750,10 +750,12 @@ class RuntimeEstimator(TorchDispatchMode):
         """
         op_time = 0.0
         if func_packet in _LEARNED_OPS:
-            assert (
-                len(out_dtypes) == 1
-            ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
-            dtype = out_dtypes.pop()
+            # assert (
+            #     len(out_dtypes) == 1
+            # ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
+            # dtype = out_dtypes.pop()
+            float_dtypes = out_dtypes & cls._float_types
+            dtype = min(float_dtypes, key=lambda x: x.itemsize)
 
             flop_count_func = flop_registry[func_packet]
             gflops = flop_count_func(*args, **kwargs, out_val=out) / 1e9

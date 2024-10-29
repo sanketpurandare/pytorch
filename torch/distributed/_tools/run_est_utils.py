@@ -4,9 +4,9 @@ import torch
 
 peak_factors: Dict[str, Dict[torch.dtype, float]] = {
     "h100": {
-        torch.float16: 0.75,
-        torch.bfloat16: 0.75,
-        torch.float32: 0.5,
+        torch.float16: 0.65,
+        torch.bfloat16: 0.65,
+        torch.float32: 0.6,
         torch.float64: 0.5
     },
     "a100": {
