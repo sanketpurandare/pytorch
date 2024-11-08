@@ -9,7 +9,8 @@ import time
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Set, Tuple
 from typing_extensions import Self
-from torch.distributed._tools.run_est_utils import get_peak_flops_registry, peak_factors
+import warnings
+from torch.distributed._tools.run_est_utils import get_peak_flops_registry, peak_factors, get_flattened_tensor
 
 import torch
 import torch.utils._pytree as pytree
@@ -416,7 +417,7 @@ class RuntimeEstimator(TorchDispatchMode):
         self.mod_bw_pre_order: List[str] = []
         self.mod_fw_post_order: List[str] = []
         self.mod_bw_post_order: List[str] = []
-        self.total_runtime: float = 0.0
+        self.total_compute_time: float = 0.0
 
         gpu_id = torch.cuda.current_device()  # Get the current GPU ID
         if gpu_id not in RuntimeEstimator.gpu_types:
@@ -424,7 +425,6 @@ class RuntimeEstimator(TorchDispatchMode):
         self.gpu_type = RuntimeEstimator.gpu_types[gpu_id]  # Assign gpu_type based on the current GPU
         RuntimeEstimator._factors = peak_factors[self.gpu_type]
         print(self.gpu_type)
-        print(RuntimeEstimator._factors)
     
     @classmethod
     def get_device_type(cls) -> str:
@@ -618,7 +618,7 @@ class RuntimeEstimator(TorchDispatchMode):
         counted_bytes = read_bytes + write_bytes
         # The GPU memory bandwidth is in GB/s so the transfer time is in nanoseconds
         transfer_time = counted_bytes / gpu_memory_bandwidth
-        return transfer_time / 2.5
+        return transfer_time
 
     @classmethod
     def _get_compute_time(cls, func_packet, args, kwargs, out, out_dtypes) -> float:  # type: ignore[no-untyped-def]
@@ -704,9 +704,13 @@ class RuntimeEstimator(TorchDispatchMode):
         op_time = 0.0
         func_packet = func._overloadpacket
         if func_packet not in _IGNORE_OPS:
-            flat_args_kwargs, args_spec = pytree.tree_flatten((args, kwargs))
-            flat_outs, out_spec = pytree.tree_flatten(out)
-            transfer_time = cls._get_transfer_time(flat_args_kwargs, flat_outs)
+            desugared_args = pytree.tree_map_only(torch.Tensor, get_flattened_tensor, args)
+            desugared_kwargs = pytree.tree_map_only(torch.Tensor, get_flattened_tensor, kwargs)
+            desugared_out = pytree.tree_map_only(torch.Tensor, get_flattened_tensor, out)
+
+            flat_args_kwargs, _ = pytree.tree_flatten((desugared_args, desugared_kwargs))
+            flat_outs, _ = pytree.tree_flatten(desugared_out)
+            transfer_time = cls._get_transfer_time(flat_args_kwargs, flat_outs) / 2
 
             out_dtypes = {
                 t.dtype
@@ -714,10 +718,7 @@ class RuntimeEstimator(TorchDispatchMode):
                 if isinstance(t, torch.Tensor) and t.dtype in cls._float_types
             }
 
-            args, kwargs = pytree.tree_unflatten(flat_args_kwargs, args_spec)
-            out = pytree.tree_unflatten(flat_outs, out_spec)
-
-            compute_time = cls._get_compute_time(func_packet, args, kwargs, out, out_dtypes)
+            compute_time = cls._get_compute_time(func_packet, desugared_args, desugared_kwargs, desugared_out, out_dtypes)
             # We get the estimated time as the max of the transfer time and
             # compute time. We divide by 1e6 to get the time in ms
             op_time = max(transfer_time, compute_time) / 1e6
@@ -789,8 +790,12 @@ class RuntimeEstimator(TorchDispatchMode):
         op_time = 0.0
         func_packet = func._overloadpacket
         if func_packet not in _IGNORE_OPS:
-            flat_args_kwargs, args_spec = pytree.tree_flatten((args, kwargs))
-            flat_outs, out_spec = pytree.tree_flatten(out)
+            desugared_args = pytree.tree_map_only(torch.Tensor, get_flattened_tensor, args)
+            desugared_kwargs = pytree.tree_map_only(torch.Tensor, get_flattened_tensor, kwargs)
+            desugared_out = pytree.tree_map_only(torch.Tensor, get_flattened_tensor, out)
+
+            flat_args_kwargs, _ = pytree.tree_flatten((desugared_args, desugared_kwargs))
+            flat_outs, _ = pytree.tree_flatten(desugared_out)
 
             out_dtypes = {
                 t.dtype
@@ -798,15 +803,12 @@ class RuntimeEstimator(TorchDispatchMode):
                 if isinstance(t, torch.Tensor) and t.dtype in cls._float_types
             }
 
-            args, kwargs = pytree.tree_unflatten(flat_args_kwargs, args_spec)
-            out = pytree.tree_unflatten(flat_outs, out_spec)
-
             if func_packet in _LEARNED_OPS:
-                op_time = cls._learned_estimate_predictor(func_packet, args, kwargs, out, out_dtypes)
+                op_time = cls._learned_estimate_predictor(func_packet, desugared_args, desugared_kwargs, desugared_out, out_dtypes)
             else:
                 # Roofline estimate.
-                transfer_time = cls._get_transfer_time(flat_args_kwargs, flat_outs)
-                compute_time = cls._get_compute_time(func_packet, args, kwargs, out, out_dtypes)
+                transfer_time = cls._get_transfer_time(flat_args_kwargs, flat_outs) / 2.75
+                compute_time = cls._get_compute_time(func_packet, desugared_args, desugared_kwargs, desugared_out, out_dtypes)
 
                 # We get the estimated time as the max of the transfer time and
                 # compute time. We divide by 1e6 to get the time in ms
@@ -853,7 +855,7 @@ class RuntimeEstimator(TorchDispatchMode):
                 self.mod_runtimes[par]["bw"] += op_time
             else:
                 self.mod_runtimes[par]["fw"] += op_time
-        self.total_runtime += op_time
+        self.total_compute_time += op_time
         return res
 
     def __call__(self, estimate_mode_type: str) -> Self:
@@ -863,6 +865,7 @@ class RuntimeEstimator(TorchDispatchMode):
         Currently supported modes:
             - "operator-level-benchmark": Estimates runtime using operator benchmarking.
             - "operator-level-cost-model": Estimates runtime using roofline cost model.
+            - "operator-level-learned-model": Estimates runtime using learned cost model.
 
         Args:
             estimate_mode_type (str): The type of estimate mode to use.
@@ -892,7 +895,7 @@ class RuntimeEstimator(TorchDispatchMode):
             fake_mode, FakeTensorMode
         ), "No FakeTensorMode found, designed to used under FakeTensorMode"
         RuntimeEstimator.fake_mode = fake_mode
-        self.total_runtime = 0.0
+        self.total_compute_time = 0.0
         self.mod_runtimes = defaultdict(lambda: defaultdict(lambda: 0.0))
         self.mod_fw_pre_order.clear()
         self.mod_bw_pre_order.clear()
@@ -919,9 +922,10 @@ class RuntimeEstimator(TorchDispatchMode):
     def __exit__(self, *args: Any) -> None:
         print(
             f"Estimated ({self._estimate_mode_type})"
-            f"total_time: {self.total_runtime:.3f} ms"
+            f" total_compute_time: {self.total_compute_time:.3f} ms"
         )
-        print("count", self.count)
+        if self._estimate_mode_type == 'operator-level-learned-model':
+            print("count", self.count)
         if len(self._no_fallback_kernel) > 0:
             print("no_fallback_kernel: ", list(self._no_fallback_kernel))
         super().__exit__(*args)

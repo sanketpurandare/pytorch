@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import timedelta
+from enum import auto, Enum
 from functools import partial, wraps
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Type, Union
 
@@ -111,6 +112,14 @@ class _FSDPModMemStats:
             _FSDPModState, List[Dict[torch.device, Dict[str, int]]]
         ] = {}
 
+class _FSDPState(Enum):
+    PRE_FW = auto()
+    FW = auto()
+    POST_FW = auto()
+    PRE_BW = auto()
+    BW = auto()
+    POST_BW = auto()
+
 
 class FSDPMemTracker(MemTracker):
     """
@@ -164,6 +173,7 @@ class FSDPMemTracker(MemTracker):
         self._in_fake_mode: bool = False
         self._fsdp_mod_to_saved_methods: WeakIdKeyDictionary = WeakIdKeyDictionary()
         self._saved_collectives: _SavedCollectives
+        self._fsdp_state: _FSDPState = _FSDPState.PRE_FW
         self._ref_class: Type[_RefType] = _FSDPRefType
 
     def _instrument_fsdp_sharded_params_grads(
@@ -202,6 +212,7 @@ class FSDPMemTracker(MemTracker):
         # For Case 2 we only capture 1 snapshot after ``FSDPState._pre_forward`` runs because it is a no-op.
         @wraps(orig_fsdp_state_pre_fw)
         def inner(*args: Any, **kwargs: Any) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+            self._fsdp_state = _FSDPState.PRE_FW
             mod_fqn = self._mod_tracker.get_known_fqn(fsdp_mod)
             assert mod_fqn is not None
             if fsdp_mod not in self.memory_tracking:
@@ -244,6 +255,7 @@ class FSDPMemTracker(MemTracker):
             else:
                 state = _FSDPModState.AFT_PRE_FW
             mod_stat.snapshots.setdefault(state, []).append(self.get_tracker_snapshot())
+            self._fsdp_state = _FSDPState.FW
             return args, kwargs
 
         return inner
@@ -269,6 +281,7 @@ class FSDPMemTracker(MemTracker):
             else:
                 state = _FSDPModState.BEF_POST_FW
             mod_stat.snapshots.setdefault(state, []).append(self.get_tracker_snapshot())
+            self._fsdp_state = _FSDPState.POST_FW
 
             output = orig_fsdp_state_post_fw(*args, **kwargs)
 
@@ -289,6 +302,7 @@ class FSDPMemTracker(MemTracker):
         # and unsharding of params. We also initialize ``local_peak`` and ``PEAK_BW`` snapshot for the module.
         @wraps(orig_fsdp_param_group_pre_backward)
         def inner(*args: Any, **kwargs: Any) -> None:
+            self._fsdp_state = _FSDPState.PRE_BW
             mod_stat = self.memory_tracking[fsdp_mod]
             snapshot = self.get_tracker_snapshot()
             mod_stat.local_peak = {
@@ -303,6 +317,7 @@ class FSDPMemTracker(MemTracker):
             mod_stat.snapshots.setdefault(_FSDPModState.AFT_PRE_BW, []).append(
                 self.get_tracker_snapshot()
             )
+            self._fsdp_state = _FSDPState.BW
 
         return inner
 
@@ -331,7 +346,7 @@ class FSDPMemTracker(MemTracker):
             mod_stat.snapshots.setdefault(_FSDPModState.BEF_POST_BW, []).append(
                 self.get_tracker_snapshot()
             )
-
+            self._fsdp_state = _FSDPState.POST_BW
             orig_fsdp_param_group_post_backward(*args, **kwargs)
 
             if fsdp_param_group := fsdp_state._fsdp_param_group:
@@ -475,11 +490,12 @@ class FSDPMemTracker(MemTracker):
             group: Union[ProcessGroup, None] = None,
             async_op: bool = False,
         ) -> Union[Work, _IllegalWork, None]:
-            self._update_and_maybe_create_winfos(
-                output_tensor,
-                _FSDPRefType.ALL_GATHER,
-                update_existing=True,
-            )
+            if self._fsdp_state in [_FSDPState.PRE_FW, _FSDPState.PRE_BW]:
+                self._update_and_maybe_create_winfos(
+                    output_tensor,
+                    _FSDPRefType.ALL_GATHER,
+                    update_existing=True,
+                )
 
             if self._in_fake_mode:
                 if async_op:
@@ -498,11 +514,12 @@ class FSDPMemTracker(MemTracker):
             group: Union[ProcessGroup, None] = None,
             async_op: bool = False,
         ) -> Union[Work, _IllegalWork, None]:
-            self._update_and_maybe_create_winfos(
-                input,
-                _FSDPRefType.REDUCE_SCATTER,
-                update_existing=True,
-            )
+            if self._fsdp_state == _FSDPState.POST_BW:
+                self._update_and_maybe_create_winfos(
+                    input,
+                    _FSDPRefType.REDUCE_SCATTER,
+                    update_existing=True,
+                )
 
             if self._in_fake_mode:
                 if async_op:

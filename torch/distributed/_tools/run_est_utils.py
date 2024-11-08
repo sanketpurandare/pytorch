@@ -1,12 +1,14 @@
 from typing import Dict
 import subprocess
+import warnings
 import torch 
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 peak_factors: Dict[str, Dict[torch.dtype, float]] = {
     "h100": {
-        torch.float16: 0.65,
-        torch.bfloat16: 0.65,
-        torch.float32: 0.6,
+        torch.float16: 0.6,
+        torch.bfloat16: 0.6,
+        torch.float32: 0.5,
         torch.float64: 0.5
     },
     "a100": {
@@ -97,3 +99,34 @@ def get_peak_flops_registry(device_name: str) -> Dict[torch.dtype, int]:
     except Exception as e:
         print(e)
         raise
+
+  
+def get_flattened_tensor(t: torch.Tensor) -> torch.Tensor:
+    """
+    Recursively extracts flattened tensor from a traceable wrapper-subclass of tensor.
+
+    Args:
+        t (torch.Tensor): The tensor to extract from.
+
+    Returns:
+        torch.Tensor: A flattened tensor.
+    """
+    unflattened_tensors = [t]
+    flattened_tensor = None
+    while len(unflattened_tensors) > 0:
+        obj = unflattened_tensors.pop()
+        if is_traceable_wrapper_subclass(obj):
+            attrs, _ = obj.__tensor_flatten__()  # type: ignore[attr-defined]
+            unflattened_tensors.extend([getattr(obj, attr) for attr in attrs])
+        else:
+            if not hasattr(obj, "untyped_storage"):
+                warnings.warn(
+                    f"Expected a tensor or a traceable wrapper-subclass of tensor, but got {type(obj)}",
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                flattened_tensor = obj
+                assert len(unflattened_tensors) == 0, "More than one flattened tensors"
+                break
+    return flattened_tensor
