@@ -81,7 +81,7 @@ _CREATE_OPS = {
 
 _IGNORE_OPS = _VIEW_OPS | _CREATE_OPS
 
-# Similar to `flop_registry`, stores the functions that make predictions
+# Similar to `flop_registry`, stores the operators that have learned predictors
 _LEARNED_OPS: Dict[Any, Any] = {}
 
 # Caches the learned models that predict ops' runtimes.
@@ -164,16 +164,26 @@ def mm_time(gpu_type, dtype, gflops, a_shape, b_shape, *args, out_shape=None, **
     n2, p = b_shape
     assert n == n2
 
+    nm = n * m
+    mp = m * p
+    np = n * p
+    intensity = (gflops * 1e9) / (nm + mp + np)
+
     dtypes = convert_dtype(dtype)
     features = {
         "n": n,
         "m": m,
         "p": p,
         "gflops": gflops,
+        "nm": nm,
+        "mp": mp,
+        "np": np,
+        "intensity": intensity,
         "dtype_16": dtypes["dtype_16"],
         "dtype_32": dtypes["dtype_32"],
         "dtype_b16": dtypes["dtype_b16"],
     }
+    
     features_df = pd.DataFrame([features])
     return float(model.predict(features_df)[0])
 
@@ -189,6 +199,11 @@ def bmm_time(gpu_type, dtype, gflops, a_shape, b_shape, out_shape=None, **kwargs
     b2, n2, p = b_shape
     assert b == b2 and n == n2
     
+    bnm = b * n * m
+    bmp = b * m * p
+    bnp = b * n * p
+    intensity = (gflops * 1e9) / (bnm + bmp + bnp)
+    
     dtypes = convert_dtype(dtype)
     features = {
         "b": b,
@@ -196,6 +211,10 @@ def bmm_time(gpu_type, dtype, gflops, a_shape, b_shape, out_shape=None, **kwargs
         "m": m,
         "p": p,
         "gflops": gflops,
+        "bnm": bnm,
+        "bmp": bmp,
+        "bnp": bnp,
+        "intensity": intensity,
         "dtype_16": dtypes["dtype_16"],
         "dtype_32": dtypes["dtype_32"],
         "dtype_b16": dtypes["dtype_b16"],
@@ -230,6 +249,13 @@ def build_sdpa_features(b, h, s_q, s_kv, d_qk, d_v, gflops, dtype, backend, is_c
 
     dtypes = convert_dtype(dtype)
     is_causal_ohe = [0, 1] if is_causal else [1, 0]
+    
+    q = b * h * s_q * d_qk
+    k = b * h * s_kv * d_qk
+    v = b * h * s_kv * d_v
+    output = b * h * s_q * d_v
+    memory_accesses = q + k + v + output
+    intensity = (gflops * 1e9) / memory_accesses
 
     features = {
         "b": b,
@@ -239,6 +265,11 @@ def build_sdpa_features(b, h, s_q, s_kv, d_qk, d_v, gflops, dtype, backend, is_c
         "d_qk": d_qk,
         "d_v": d_v,
         "gflops": gflops,
+        "q": q,
+        "k": k,
+        "v": v,
+        "output": output,
+        "intensity": intensity,
         "dtype_16": dtypes["dtype_16"],
         "dtype_32": dtypes["dtype_32"],
         "dtype_b16": dtypes["dtype_b16"],
