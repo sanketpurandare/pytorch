@@ -10,6 +10,7 @@ from collections import defaultdict
 from typing import Any, Callable, Dict, List, Set, Tuple
 from typing_extensions import Self
 import warnings
+from math import prod
 from torch.distributed._tools.run_est_utils import get_peak_flops_registry, peak_factors, get_flattened_tensor
 
 import torch
@@ -339,19 +340,69 @@ def sdpa_backward_flash_time(gpu_type, dtype, gflops, grad_out_shape, query_shap
     features = build_sdpa_features(b, h, s_q, s_kv, d_qk, d_v, gflops, dtype, "flash", is_causal=is_causal_sdpa(args))
     return float(model.predict(features)[0])
 
-# @register_timing_formula([aten.convolution, aten._convolution])
-# def conv_time(gpu_type, dtype, gflops, x_shape, w_shape, _bias, _stride, _padding, _dilation, transposed, *args, out_shape=None, **kwargs) -> float:
-#     """
-#     TODO: need to add support for higher dims.
-#     """
-#     model = get_learned_model("conv", gpu_type)
 
-#     # batch_size = x_shape[0]
-#     # conv_shape = (x_shape if transposed else out_shape)[2:]
-#     # c_out, c_in, *filter_size = w_shape
+def build_conv2d_features(gflops, dtype, x_shape, w_shape, _stride, _padding, _dilation, transposed, args, out_shape) -> pd.DataFrame:
+    dtypes = convert_dtype(dtype)
 
-#     # features = np.array([[b, m, k, n, gflops]])
-#     return model.predict(features)
+    b, in_channels, iH, iW = x_shape
+    _b, out_channels, oH, oW = out_shape
+
+    assert b == _b, "Batch dimension doesn't match in input and output"
+
+    if transposed:
+        in_channels, out_channels_over_groups, *filter_size = w_shape
+        groups = out_channels // out_channels_over_groups
+    else:
+        out_channels, in_channels_over_groups, *filter_size = w_shape
+        groups = in_channels // in_channels_over_groups
+
+    if len(filter_size) != 2:
+        return None
+    kH, kW = filter_size
+
+    input_memory_accesses = b * in_channels * iH * iW
+    kernel_memory_accesses = out_channels * (in_channels // groups) * kH * kW
+    output_memory_accesses = b * out_channels * oH * oW
+    memory_accesses = input_memory_accesses + kernel_memory_accesses + output_memory_accesses
+    intensity = (gflops * 1e9) / memory_accesses
+
+    stride = _stride if isinstance(_stride, int) else _stride[0]
+    dilation = _dilation if isinstance(_dilation, int) else _dilation[0]
+
+    features = {
+        "b": b,
+        "in_channels": in_channels,
+        "iH": iH,
+        "iW": iW,
+        "out_channels": out_channels,
+        "groups": groups,
+        "kH": kH,
+        "kW": kW,
+        "stride": stride,
+        "dilation": dilation,
+        "oH": oH,
+        "oW": oW,
+        "gflops": gflops,
+        "input": input_memory_accesses,
+        "kernel": kernel_memory_accesses,
+        "output": output_memory_accesses,
+        "intensity": intensity,
+        "dtype_16": dtypes["dtype_16"],
+        "dtype_32": dtypes["dtype_32"],
+        "dtype_b16": dtypes["dtype_b16"],
+        "transposed_0": not transposed,
+        "transposed_1": transposed,
+    }
+    return pd.DataFrame([features])
+
+
+@register_timing_formula([aten.convolution, aten._convolution])
+def conv_time(gpu_type, dtype, gflops, x_shape, w_shape, _bias, _stride, _padding, _dilation, transposed, *args, out_shape=None, **kwargs) -> float:
+    """Only supports Conv2D for now."""
+    model = get_learned_model("conv", gpu_type)
+    features = build_conv2d_features(gflops, dtype, x_shape, w_shape, _stride, _padding, _dilation, transposed, args, out_shape)
+    return float(model.predict(features)[0])
+
 
 # @register_timing_formula(aten.convolution_backward)
 # def conv_backward_time(
@@ -377,6 +428,7 @@ def sdpa_backward_flash_time(gpu_type, dtype, gflops, grad_out_shape, query_shap
 
 #     # features = np.array([[b, m, k, n, gflops]])
 #     return model.predict(features)
+
 
 class RuntimeEstimator(TorchDispatchMode):
     """
