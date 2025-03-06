@@ -9,15 +9,30 @@ import torch
 import torch.utils._pytree as pytree
 from torch._guards import active_fake_mode
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.distributed import DeviceMesh
+from torch.distributed._tools.comm_models import predict_communication
 from torch.distributed._tools.common_utils import get_flattened_tensor
+from torch.distributed._tools.compute_models import (
+    learned_estimate_predictor,
+    LEARNED_OPS,
+)
+from torch.distributed._tools.fake_collectives import (
+    collective_ops,
+    CollectiveOp,
+    non_functional_collectives,
+    sync_ops,
+)
 from torch.distributed._tools.mod_tracker import ModTracker
 from torch.distributed._tools.runest_utils import (
     CREATE_OPS,
     get_estimation_configs,
+    OPS_TO_ALWAYS_SKIP,
     REDUCTION_OPS,
     resolve_gpu_type,
     VIEW_OPS,
 )
+from torch.distributed._tools.runtime_simulator import OpType, Resource, Simulator
+from torch.distributed.distributed_c10d import ProcessGroup
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
@@ -30,7 +45,7 @@ aten = torch.ops.aten
 _PYTORCH_MIN_ALLOCATE = (
     2**9 if int(os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING", 0)) == 0 else 1
 )
-
+_MiB = 2**20
 
 _IGNORE_OPS = VIEW_OPS | CREATE_OPS
 
@@ -91,14 +106,18 @@ class RuntimeEstimator(TorchDispatchMode):
     _peak_bandwidth: float
     _no_fallback_kernel: set[torch._ops._OpNamespace] = set()
     _gpu_type: str = ""
-    fake_mode: FakeTensorMode
+    _fake_mode: FakeTensorMode
+    estimate_mode_type: str
+    compute_estimate: Callable
+    pg_to_resource: dict[ProcessGroup, Resource] = {}
 
-    def __init__(self) -> None:
+    def __init__(self, simulate: bool = False) -> None:
         super().__init__()
-        self._estimate: Callable
-        self._estimate_mode_type: str
         self._mod_tracker = ModTracker()
-        self.mod_runtimes: dict[str, dict[str, float]] = defaultdict(
+        self.mod_comptimes: dict[str, dict[str, float]] = defaultdict(
+            lambda: defaultdict(lambda: 0.0)
+        )
+        self.mod_commtimes: dict[str, dict[str, float]] = defaultdict(
             lambda: defaultdict(lambda: 0.0)
         )
         self.mod_fw_pre_order: list[str] = []
@@ -106,6 +125,12 @@ class RuntimeEstimator(TorchDispatchMode):
         self.mod_fw_post_order: list[str] = []
         self.mod_bw_post_order: list[str] = []
         self.total_compute_time: float = 0.0
+        self.total_comm_time: float = 0.0
+        self.simulated_time: float = 0.0
+        self.simulator = None
+        self.simulate = simulate
+        if simulate:
+            self.simulator = Simulator(RuntimeEstimator.pg_to_resource)
 
     @classmethod
     def init_configs(
@@ -156,6 +181,46 @@ class RuntimeEstimator(TorchDispatchMode):
             else custom_config
         )
 
+    @classmethod
+    def init_pg_resources(cls, world_mesh: Optional[DeviceMesh]):
+        if world_mesh is not None:
+            _ndims = world_mesh.ndim
+            assert _ndims <= 3, "Does not support > 3D mesh"
+            _mesh_dim_names = world_mesh.mesh_dim_names
+            if _ndims == 3:
+                # Assume HSDP + TP
+                tp_pg = world_mesh.get_group("tp")
+                dp_replicate_pg = world_mesh.get_group("dp_replicate")
+                dp_shard_pg = world_mesh.get_group("dp_shard")
+
+                cls.pg_to_resource[tp_pg] = Resource.INTRA_COMM
+                cls.pg_to_resource[dp_replicate_pg] = Resource.INTER_COMM
+                cls.pg_to_resource[dp_shard_pg] = Resource.INTER_COMM
+
+            elif _ndims == 2:
+                # Can be HSDP or FSDP + TP
+                if "tp" in _mesh_dim_names:
+                    # Assume FSDP + TP
+                    tp_pg = world_mesh.get_group("tp")
+                    dp_pg = world_mesh.get_group("dp")
+                    cls.pg_to_resource[tp_pg] = Resource.INTRA_COMM
+                    cls.pg_to_resource[dp_pg] = Resource.INTER_COMM
+                else:
+                    # Assume HSDP
+                    dp_replicate_pg = world_mesh.get_group("dp_replicate")
+                    dp_shard_pg = world_mesh.get_group("dp_shard")
+                    cls.pg_to_resource[dp_replicate_pg] = Resource.INTER_COMM
+                    cls.pg_to_resource[dp_shard_pg] = Resource.INTER_INTRA_COMM
+
+            else:
+                # Assume FSDP
+                dp_pg = world_mesh.get_group("dp")
+                cls.pg_to_resource[dp_pg] = Resource.INTER_INTRA_COMM
+
+        _default_pg = torch.distributed.group.WORLD
+        if _default_pg is not None and _default_pg not in cls.pg_to_resource:
+            cls.pg_to_resource[_default_pg] = Resource.INTER_INTRA_COMM
+
     # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_subclasses/fake_tensor.py#L1969  # noqa: PGH004,B950
     # NB: returns fake tensors
     @classmethod
@@ -193,7 +258,7 @@ class RuntimeEstimator(TorchDispatchMode):
         with no_dispatch():
 
             def to_real_tensor(e):  # type: ignore[no-untyped-def]
-                if cls.fake_mode.is_our_fake(e):
+                if cls._fake_mode.is_our_fake(e):
                     if e.dtype in cls._float_types:
                         out = torch.rand_like(e, device=e.fake_device)
                     else:
@@ -244,8 +309,8 @@ class RuntimeEstimator(TorchDispatchMode):
                 if id(e) in inp_impls:
                     return inp_impls[id(e)]
                 else:
-                    return cls.fake_mode.fake_tensor_converter.from_real_tensor(
-                        cls.fake_mode, e
+                    return cls._fake_mode.fake_tensor_converter.from_real_tensor(
+                        cls._fake_mode, e
                     )
             else:
                 return e
@@ -285,11 +350,20 @@ class RuntimeEstimator(TorchDispatchMode):
         res = func(*args, **kwargs or {})
         return (res, mean_op_time)
 
+    @classmethod
+    def _desugar_args_kwargs_out(cls, args, kwargs, out) -> tuple[Any, Any, Any]:  # type: ignore[no-untyped-def]
+        desugared_args = pytree.tree_map_only(torch.Tensor, get_flattened_tensor, args)
+        desugared_kwargs = pytree.tree_map_only(
+            torch.Tensor, get_flattened_tensor, kwargs
+        )
+        desugared_out = pytree.tree_map_only(torch.Tensor, get_flattened_tensor, out)
+        return (desugared_args, desugared_kwargs, desugared_out)
+
     # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_inductor/scheduler.py#L589  # noqa: PGH004,B950
     @classmethod
-    def _roofline_estimate(cls, func, args, kwargs) -> tuple[Any, float]:  # type: ignore[no-untyped-def]
+    def _roofline_or_learned_estimate(cls, func, args, kwargs) -> tuple[Any, float]:  # type: ignore[no-untyped-def]
         """
-        Estimates the runtime of a function using a roofline cost model.
+        Estimates the runtime of a function using a roofline and/or learned cost model.
 
         Args:
             func: The function to estimate.
@@ -336,8 +410,7 @@ class RuntimeEstimator(TorchDispatchMode):
                 float: The estimated compute time in nanoseconds.
             """
             if func_packet in flop_registry:
-                float_dtypes = out_dtypes & cls._float_types
-                dtype = min(float_dtypes, key=lambda x: x.itemsize)
+                dtype = min(out_dtypes, key=lambda x: x.itemsize)
                 # This gives GFLOPS/sec for the given dtype
                 peak_gpu_flops = cls._peak_flops_reg[dtype]
                 # factor determines the peak flops that are empirically attained by compute ops
@@ -408,32 +481,79 @@ class RuntimeEstimator(TorchDispatchMode):
         op_time = 0.0
         func_packet = func._overloadpacket
         if func_packet not in _IGNORE_OPS:
-            desugared_args = pytree.tree_map_only(
-                torch.Tensor, get_flattened_tensor, args
-            )
-            desugared_kwargs = pytree.tree_map_only(
-                torch.Tensor, get_flattened_tensor, kwargs
-            )
-            desugared_out = pytree.tree_map_only(
-                torch.Tensor, get_flattened_tensor, out
+            desugared_args, desugared_kwargs, desugared_out = (
+                cls._desugar_args_kwargs_out(args, kwargs, out)
             )
 
             flat_args_kwargs, _ = pytree.tree_flatten(
                 (desugared_args, desugared_kwargs)
             )
             flat_outs, _ = pytree.tree_flatten(desugared_out)
-            transfer_time = (
-                get_transfer_time(func_packet, flat_args_kwargs, flat_outs) / 1.5
-            )
-            out_dtypes = {t.dtype for t in flat_outs if isinstance(t, torch.Tensor)}
-            compute_time = get_compute_time(
-                func_packet, desugared_args, desugared_kwargs, desugared_out, out_dtypes
-            )
-            # We get the estimated time as the max of the transfer time and
-            # compute time. We divide by 1e6 to get the time in ms
-            op_time = max(transfer_time, compute_time) / 1e6
+            out_dtypes = {
+                t.dtype for t in flat_outs if isinstance(t, torch.Tensor)
+            } & cls._float_types
+            if (
+                cls.estimate_mode_type == "operator-level-learned-model"
+                and func_packet in LEARNED_OPS
+            ):
+                op_time = learned_estimate_predictor(
+                    func_packet,
+                    desugared_args,
+                    desugared_kwargs,
+                    desugared_out,
+                    out_dtypes,
+                    cls._gpu_type,
+                )
+            else:
+                transfer_time = (
+                    get_transfer_time(func_packet, flat_args_kwargs, flat_outs) / 1.5
+                )
+
+                compute_time = get_compute_time(
+                    func_packet,
+                    desugared_args,
+                    desugared_kwargs,
+                    desugared_out,
+                    out_dtypes,
+                )
+                # We get the estimated time as the max of the transfer time and
+                # compute time. We divide by 1e6 to get the time in ms
+                op_time = max(transfer_time, compute_time) / 1e6
 
         return (out, op_time)
+
+    @classmethod
+    def comm_estimate(cls, func, args, kwargs) -> tuple[Any, float]:
+        kwargs = kwargs if kwargs else {}
+        op_time = 0.0
+        res = func(*args, **kwargs)
+        if func not in sync_ops:
+            desugared_args, desugared_kwargs, desugared_res = (
+                cls._desugar_args_kwargs_out(args, kwargs, res)
+            )
+            process_group = CollectiveOp.get_process_group(func, desugared_args)
+            comm_size = CollectiveOp.get_comm_tensor_size(
+                func, desugared_res, desugared_args, desugared_kwargs
+            )
+            num_ranks = process_group.size()
+            comm_resource = cls.pg_to_resource[process_group]
+            internode_only = comm_resource == Resource.INTER_COMM
+            comm_size_mib = comm_size / _MiB
+            analytical_mode = not (
+                cls.estimate_mode_type == "operator-level-learned-model"
+            )
+            op_time = predict_communication(
+                func, comm_size_mib, num_ranks, internode_only, analytical_mode
+            )
+        return (res, op_time)
+
+    @classmethod
+    def runtime_estimate(cls, func, args, kwargs) -> tuple[Any, float]:
+        if func in collective_ops:
+            res, op_time = cls.comm_estimate(func, args, kwargs)
+        else:
+            res, op_time = cls.compute_estimate(func, args, kwargs)
+        return res, op_time
 
     def display_modulewise_stats(self, depth: int = 2) -> None:
         """
@@ -457,7 +577,7 @@ class RuntimeEstimator(TorchDispatchMode):
             if mod_depth > depth:
                 continue
             print(mod_fqn)
-        for mod_fqn, runtimes in self.mod_runtimes.items():
+        for mod_fqn, runtimes in self.mod_comptimes.items():
             mod_depth = mod_fqn.count(".") + 1
             if mod_depth > depth:
                 continue
@@ -466,16 +586,51 @@ class RuntimeEstimator(TorchDispatchMode):
             )
 
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):  # type: ignore[no-untyped-def]
-        # TODO: @sanketpurandare: Add logic for incorporating communication time
-        res, op_time = self._estimate(func, args, kwargs)
+        res, op_time = RuntimeEstimator.runtime_estimate(func, args, kwargs)
         # if func._overloadpacket not in OPS_TO_ALWAYS_SKIP:
         #     print(f"{func._overloadpacket}: {op_time:.3f}")
+        is_comm_op = func in collective_ops
         for par in self._mod_tracker.parents:
             if self._mod_tracker.is_bw:
-                self.mod_runtimes[par]["bw"] += op_time
+                if is_comm_op:
+                    self.mod_commtimes[par]["bw"] += op_time
+                else:
+                    self.mod_comptimes[par]["bw"] += op_time
             else:
-                self.mod_runtimes[par]["fw"] += op_time
-        self.total_compute_time += op_time
+                if is_comm_op:
+                    self.mod_commtimes[par]["fw"] += op_time
+                else:
+                    self.mod_comptimes[par]["fw"] += op_time
+        if is_comm_op:
+            self.total_comm_time += op_time
+        else:
+            self.total_compute_time += op_time
+
+        if self.simulate and func not in OPS_TO_ALWAYS_SKIP:
+            resource = Resource.COMP
+            op_type = OpType.compute
+            if is_comm_op and func not in [
+                torch.ops.c10d.monitored_barrier_.default,
+                torch.ops._c10d_functional.wait_tensor.default,
+            ]:
+                pg = CollectiveOp.get_process_group(func, args)
+                resource = self.pg_to_resource[pg]
+                op_type = OpType.collective
+
+            op_info = self.simulator.create_and_queue_op(
+                func=func,
+                op_type=op_type,
+                resource=resource,
+                op_time=op_time,
+            )
+
+        if (
+            func in non_functional_collectives
+            and func != torch.ops.c10d.monitored_barrier_.default
+        ):
+            fake_work = CollectiveOp.get_work(func, res)
+            self.simulator.work_registry[id(fake_work.boxed())] = op_info
+
         return res
 
     def __call__(
@@ -485,6 +640,7 @@ class RuntimeEstimator(TorchDispatchMode):
         custom_config: Optional[
             tuple[dict[torch.dtype, float], dict[torch.dtype, float], float]
         ] = None,
+        world_mesh: Optional[DeviceMesh] = None,
     ) -> Self:
         """
         Configures the runtime estimation mode and initializes GPU-specific configurations.
@@ -492,6 +648,8 @@ class RuntimeEstimator(TorchDispatchMode):
         Supported Modes:
             - `"operator-level-benchmark"`: Estimates runtime using operator benchmarking.
             - `"operator-level-cost-model"`: Estimates runtime using a roofline cost model.
+            - `"operator-level-learned-model"`: Estimates runtime using a learned cost model.
+
 
         Args:
             estimate_mode_type (str):
@@ -515,15 +673,21 @@ class RuntimeEstimator(TorchDispatchMode):
                 If `estimate_mode_type` is not a supported runtime estimation mode.
         """
         if estimate_mode_type == "operator-level-benchmark":
-            self._estimate = RuntimeEstimator._benchmark_estimate
-        elif estimate_mode_type == "operator-level-cost-model":
-            self._estimate = RuntimeEstimator._roofline_estimate
+            RuntimeEstimator.compute_estimate = RuntimeEstimator._benchmark_estimate
+        elif estimate_mode_type in [
+            "operator-level-cost-model",
+            "operator-level-learned-model",
+        ]:
+            RuntimeEstimator.compute_estimate = (
+                RuntimeEstimator._roofline_or_learned_estimate
+            )
         else:
             raise NotImplementedError(
                 f"estimate_mode_type {estimate_mode_type} not supported"
             )
-        self._estimate_mode_type = estimate_mode_type
+        RuntimeEstimator.estimate_mode_type = estimate_mode_type
         RuntimeEstimator.init_configs(gpu_type, custom_config)
+        RuntimeEstimator.init_pg_resources(world_mesh)
         return self
 
     def __enter__(self) -> Self:
@@ -533,7 +697,9 @@ class RuntimeEstimator(TorchDispatchMode):
         )
         RuntimeEstimator.fake_mode = fake_mode
         self.total_compute_time = 0.0
-        self.mod_runtimes = defaultdict(lambda: defaultdict(lambda: 0.0))
+        self.total_comm_time = 0.0
+        self.mod_comptimes = defaultdict(lambda: defaultdict(lambda: 0.0))
+        self.mod_commtimes = defaultdict(lambda: defaultdict(lambda: 0.0))
         self.mod_fw_pre_order.clear()
         self.mod_bw_pre_order.clear()
         self.mod_fw_post_order.clear()
@@ -552,6 +718,8 @@ class RuntimeEstimator(TorchDispatchMode):
                 self._mod_tracker.get_known_fqn(mod) if mod is not None else ""
             ),
         )
+        if self.simulate:
+            self.simulator.capture_sync_ops()
         self._mod_tracker.__enter__()
         super().__enter__()
         return self
@@ -559,6 +727,9 @@ class RuntimeEstimator(TorchDispatchMode):
     def __exit__(self, *args: Any) -> None:
         if len(self._no_fallback_kernel) > 0:
             print("no_fallback_kernel: ", list(self._no_fallback_kernel))
+        if self.simulate:
+            self.simulated_time = self.simulator.simulate()
+            self.simulator.restore_sync_ops()
         super().__exit__(*args)
         self._mod_tracker.clear_user_hooks()
         self._mod_tracker.__exit__()
