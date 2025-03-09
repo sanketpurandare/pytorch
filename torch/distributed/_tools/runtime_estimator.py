@@ -2,6 +2,7 @@
 import math
 import os
 from collections import defaultdict
+from enum import auto, Enum
 from typing import Any, Callable, Optional
 from typing_extensions import Self
 
@@ -31,7 +32,7 @@ from torch.distributed._tools.runest_utils import (
     resolve_gpu_type,
     VIEW_OPS,
 )
-from torch.distributed._tools.runtime_simulator import OpType, Resource, Simulator
+from torch.distributed._tools.runtime_simulator import Resource, Simulator
 from torch.distributed.distributed_c10d import ProcessGroup
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -47,10 +48,18 @@ _PYTORCH_MIN_ALLOCATE = (
 )
 _MiB = 2**20
 
-_IGNORE_OPS = VIEW_OPS | CREATE_OPS
+_VIEW_OR_CREATE_OPS = VIEW_OPS | CREATE_OPS
 
 __all__ = ["RuntimeEstimator"]
 
+class ComputeEstimate(Enum):
+    BENCHMARK = auto()
+    ANALYTICAL = auto()
+    LEARNED = auto()
+
+class CommEstimate(Enum):
+    ANALYTICAL = auto()
+    LEARNED = auto()
 
 class RuntimeEstimator(TorchDispatchMode):
     """
@@ -109,7 +118,7 @@ class RuntimeEstimator(TorchDispatchMode):
     _fake_mode: FakeTensorMode
     estimate_mode_type: str
     compute_estimate: Callable
-    pg_to_resource: dict[ProcessGroup, Resource] = {}
+    pg_to_resource: dict[ProcessGroup, set[Resource]] = defaultdict(set)
 
     def __init__(self, simulate: bool = False) -> None:
         super().__init__()
@@ -193,9 +202,9 @@ class RuntimeEstimator(TorchDispatchMode):
                 dp_replicate_pg = world_mesh.get_group("dp_replicate")
                 dp_shard_pg = world_mesh.get_group("dp_shard")
 
-                cls.pg_to_resource[tp_pg] = Resource.INTRA_COMM
-                cls.pg_to_resource[dp_replicate_pg] = Resource.INTER_COMM
-                cls.pg_to_resource[dp_shard_pg] = Resource.INTER_COMM
+                cls.pg_to_resource[tp_pg].add(Resource.INTRA_COMM)
+                cls.pg_to_resource[dp_replicate_pg].add(Resource.INTER_COMM)
+                cls.pg_to_resource[dp_shard_pg].add(Resource.INTER_COMM)
 
             elif _ndims == 2:
                 # Can be HSDP or FSDP + TP
@@ -203,23 +212,23 @@ class RuntimeEstimator(TorchDispatchMode):
                     # Assume FSDP + TP
                     tp_pg = world_mesh.get_group("tp")
                     dp_pg = world_mesh.get_group("dp")
-                    cls.pg_to_resource[tp_pg] = Resource.INTRA_COMM
-                    cls.pg_to_resource[dp_pg] = Resource.INTER_COMM
+                    cls.pg_to_resource[tp_pg].add(Resource.INTRA_COMM)
+                    cls.pg_to_resource[dp_pg].add(Resource.INTER_COMM)
                 else:
                     # Assume HSDP
                     dp_replicate_pg = world_mesh.get_group("dp_replicate")
                     dp_shard_pg = world_mesh.get_group("dp_shard")
-                    cls.pg_to_resource[dp_replicate_pg] = Resource.INTER_COMM
-                    cls.pg_to_resource[dp_shard_pg] = Resource.INTER_INTRA_COMM
+                    cls.pg_to_resource[dp_replicate_pg].add(Resource.INTER_COMM)
+                    cls.pg_to_resource[dp_shard_pg].update([Resource.INTER_COMM, Resource.INTER_COMM])
 
             else:
                 # Assume FSDP
                 dp_pg = world_mesh.get_group("dp")
-                cls.pg_to_resource[dp_pg] = Resource.INTER_INTRA_COMM
+                cls.pg_to_resource[dp_pg].update([Resource.INTER_COMM, Resource.INTER_COMM])
 
         _default_pg = torch.distributed.group.WORLD
         if _default_pg is not None and _default_pg not in cls.pg_to_resource:
-            cls.pg_to_resource[_default_pg] = Resource.INTER_INTRA_COMM
+            cls.pg_to_resource[_default_pg].update([Resource.INTER_COMM, Resource.INTER_COMM])
 
     # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_subclasses/fake_tensor.py#L1969  # noqa: PGH004,B950
     # NB: returns fake tensors
@@ -336,7 +345,7 @@ class RuntimeEstimator(TorchDispatchMode):
             "Initialize/Assign FakeTensorMode before using this function"
         )
         mean_op_time = 0.0
-        if func._overloadpacket not in _IGNORE_OPS:
+        if func._overloadpacket not in _VIEW_OR_CREATE_OPS:
             try:
                 res, mean_op_time = cls._maybe_run_and_benchmark_fallback_kernel(
                     func,
@@ -480,7 +489,7 @@ class RuntimeEstimator(TorchDispatchMode):
         out = func(*args, **kwargs)
         op_time = 0.0
         func_packet = func._overloadpacket
-        if func_packet not in _IGNORE_OPS:
+        if func_packet not in _VIEW_OR_CREATE_OPS:
             desugared_args, desugared_kwargs, desugared_out = (
                 cls._desugar_args_kwargs_out(args, kwargs, out)
             )
@@ -537,7 +546,7 @@ class RuntimeEstimator(TorchDispatchMode):
             )
             num_ranks = process_group.size()
             comm_resource = cls.pg_to_resource[process_group]
-            internode_only = comm_resource == Resource.INTER_COMM
+            internode_only = (comm_resource == {Resource.INTER_COMM})
             comm_size_mib = comm_size / _MiB
             analytical_mode = not (
                 cls.estimate_mode_type == "operator-level-learned-model"
@@ -607,30 +616,7 @@ class RuntimeEstimator(TorchDispatchMode):
             self.total_compute_time += op_time
 
         if self.simulate and func not in OPS_TO_ALWAYS_SKIP:
-            resource = Resource.COMP
-            op_type = OpType.compute
-            if is_comm_op and func not in [
-                torch.ops.c10d.monitored_barrier_.default,
-                torch.ops._c10d_functional.wait_tensor.default,
-            ]:
-                pg = CollectiveOp.get_process_group(func, args)
-                resource = self.pg_to_resource[pg]
-                op_type = OpType.collective
-
-            op_info = self.simulator.create_and_queue_op(
-                func=func,
-                op_type=op_type,
-                resource=resource,
-                op_time=op_time,
-            )
-
-        if (
-            func in non_functional_collectives
-            and func != torch.ops.c10d.monitored_barrier_.default
-        ):
-            fake_work = CollectiveOp.get_work(func, res)
-            self.simulator.work_registry[id(fake_work.boxed())] = op_info
-
+            self.simulator.record_op(func, args, kwargs, res)
         return res
 
     def __call__(
