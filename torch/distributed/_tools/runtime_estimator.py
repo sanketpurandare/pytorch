@@ -399,35 +399,41 @@ def build_conv2d_features(gflops, dtype, x_shape, w_shape, _stride, _padding, _d
 @register_timing_formula([aten.convolution, aten._convolution])
 def conv_time(gpu_type, dtype, gflops, x_shape, w_shape, _bias, _stride, _padding, _dilation, transposed, *args, out_shape=None, **kwargs) -> float:
     """Only supports Conv2D for now."""
-    model = get_learned_model("conv", gpu_type)
+    if transposed:
+        model = get_learned_model("conv", gpu_type)
+    else:
+        model = get_learned_model("conv_t", gpu_type)
     features = build_conv2d_features(gflops, dtype, x_shape, w_shape, _stride, _padding, _dilation, transposed, args, out_shape)
     return float(model.predict(features)[0])
 
 
-# @register_timing_formula(aten.convolution_backward)
-# def conv_backward_time(
-#     gpu_type,
-#     dtype,
-#     gflops,
-#     grad_out_shape,
-#     x_shape,
-#     w_shape,
-#     _bias,
-#     _stride,
-#     _padding,
-#     _dilation,
-#     transposed,
-#     _output_padding,
-#     _groups,
-#     output_mask,
-#     out_shape) -> float:
-#     """
-#     TODO: need to add support for higher dims.
-#     """
-#     model = get_learned_model("conv_backward", gpu_type)
-
-#     # features = np.array([[b, m, k, n, gflops]])
-#     return model.predict(features)
+@register_timing_formula(aten.convolution_backward)
+def conv_backward_time(
+    gpu_type,
+    dtype,
+    gflops,
+    grad_out_shape,
+    x_shape,
+    w_shape,
+    _bias,
+    _stride,
+    _padding,
+    _dilation,
+    transposed,
+    _output_padding,
+    _groups,
+    output_mask,
+    out_shape) -> float:
+    """
+    TODO: need to add support for higher dims.
+    """
+    args = None
+    if transposed:
+        model = get_learned_model("conv_backward", gpu_type)
+    else:
+        model = get_learned_model("conv_t_backward", gpu_type)
+    features = build_conv2d_features(gflops, dtype, x_shape, w_shape, _stride, _padding, _dilation, transposed, args, out_shape)
+    return float(model.predict(features)[0])
 
 
 class RuntimeEstimator(TorchDispatchMode):
