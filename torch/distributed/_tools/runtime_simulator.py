@@ -152,26 +152,27 @@ class Simulator:
             to the set of resources they use.
     """
 
-    def __init__(self, pg_to_resource:  WeakKeyDictionary[ProcessGroup, set[Resource]]):
+    def __init__(self, pg_to_resource: WeakKeyDictionary[ProcessGroup, set[Resource]]):
         self.streamid_to_queue: dict[int, _Queue] = {}
         self._pg_to_resource = pg_to_resource
         # Simulator pre-processing/capture telemetry
-        #   a. seq_id: A unique sequence number assigned to each recorded op following 
+        #   a. seq_id: A unique sequence number assigned to each recorded op following
         #       the CPU dispatch order
-        #   b. work_registry: Mapping from the seq_id of the `FakeWork` object to the 
+        #   b. work_registry: Mapping from the seq_id of the `FakeWork` object to the
         #       'op_info' of the non-functional collective that produced it.
-        #   c. wait_tensor_registry: Mapping from the `torch.UntypedStorage` object of 
-        #       the `AsyncCollectiveTensor` to the 'op_info's of the functional collective 
+        #   c. wait_tensor_registry: Mapping from the `torch.UntypedStorage` object of
+        #       the `AsyncCollectiveTensor` to the 'op_info's of the functional collective
         #       that produced it.
-        #   d. global_sync_infos: Used to store the global sync operations that affect/block 
+        #   d. global_sync_infos: Used to store the global sync operations that affect/block
         #       all the streams. They will used by the streams that will be discovered
         #       later in the execution order by the simulator's record/capture mechanism to
         #       populate their local sync ops.
-        #   e. sync_count: A global sync counter is maintained specifically for each `torch.cuda.synchronize`
-        #       call. This helps to identify whether all the queues are waiting for the same
-        #       sync call.
-        #   f. event_wait_ids: 
-        #   g. event_record_ids:
+        #   e. sync_count: A global sync counter is maintained specifically for each
+        #       `torch.cuda.synchronize` call. This helps to identify whether all the queues
+        #       are waiting for the same sync call.
+        #   f. event_wait_ids: Logs all the event_ids encountered for any the sync op
+        #       associated with event wait.
+        #   g. event_record_ids: Logs all the event_ids that recorded
         self._seq_id: int = 0
         self._work_registry: dict[int, _OpInfo] = {}
         self._wait_tensor_registry: WeakKeyDictionary[
@@ -345,10 +346,10 @@ class Simulator:
         ) -> None:
             # 1. We obtain the seq_id of the last operation enqueued in 'self_stream', this acts
             #   as the `blocking_seq_id` after which the stream will be blocked till all the
-            #   operations enqueued so far'dst_stream' are completed.
+            #   operations enqueued so far in the 'dst_stream' are completed.
             # 2. The seq_id of the last operation enqueued in 'dst_stream' acts as the
             #   `releasing_seq_id`, the completion of which unblocks the 'self_stream'.
-            # 3. If no operations are enqueued in 'dst_stream' i.e. when `releasing_seq_id`,
+            # 3. If no operations are enqueued in 'dst_stream' i.e. when `releasing_seq_id = -1`,
             #   no blocking/unblocking is required and the call can be ignored.
             sync_op = _SyncOp.wait_stream
             logger.debug(
@@ -487,7 +488,7 @@ class Simulator:
             # 1. We obtain the seq_id of the last operation enqueued for all the streams,
             #   discovered so far. They act as the `blocking_seq_id` after which the streams
             #   will be blocked till all of them synchronize.
-            # 2. A global sync counter is recorded as the sync_id to identify whether all the 
+            # 2. A global sync counter is recorded as the sync_id to identify whether all the
             #   queues are waiting for the same sync call.
             # 3. Since, this operation affects/blocks all the streams, it is also recorded as
             #   a global sync event that will be waited on by the streams that will be discovered
@@ -605,7 +606,7 @@ class Simulator:
                         )
                 queue.state = _State.WAITING
 
-    def _maybe_update_queue_states(self) -> None:
+    def _maybe_resolve_global_sync(self) -> None:
         # 1. First we test if all queues are in WAITING state. This is only true when
         #   a global synchrnozation like torch.cuda.synchronize() is called.
         #   If that is not the case, then we error out, since it is a deadlock
@@ -639,18 +640,22 @@ class Simulator:
                 # If wait list is now empty, mark queue READY
                 if not queue.wait_sync_infos:
                     queue.state = _State.READY
-        # 4. We mark a queue as READY if it is in WAITING state but all its
-        #   synchronization operations have been completed.
-        # 5. We mark a queue as COMPLETED if it satisfies all of the four conditions:
-        #   a. The queue is in READY state
-        #   b. The queue has exhausted all the operations
-        #   c. The queue has no synchronization operations pending
-        #   d. The queue is not incorrectly waiting on a synchronization operation
 
+    def _maybe_resolve_waiting_queues(self) -> None:
+        # We mark a queue as READY if it is in WAITING state but all its
+        # synchronization operations have been completed.
         for queue in self.streamid_to_queue.values():
             if queue.state == _State.WAITING and not queue.wait_sync_infos:
                 queue.state = _State.READY
 
+    def _all_queues_completed(self) -> bool:
+        # 1. We mark a queue as COMPLETED if it satisfies all of the four conditions:
+        #   a. The queue is in READY state
+        #   b. The queue has exhausted all the operations
+        #   c. The queue has no synchronization operations pending
+        #   d. The queue is not incorrectly waiting on a synchronization operation
+        # 2. Only when all the queues have completed, we return True.
+        for queue in self.streamid_to_queue.values():
             if (
                 queue.state == _State.READY
                 and not queue.ops
@@ -658,12 +663,6 @@ class Simulator:
                 and not queue.wait_sync_infos
             ):
                 queue.state = _State.COMPLETE
-
-    def _all_queues_completed(self) -> bool:
-        # 1. We first update the state of all queues and try to qualify the queues
-        #   to READY or COMPLETE states whenever possible.
-        # 2. Only when all the queues have completed, we return True.
-        self._maybe_update_queue_states()
         return all(
             queue.state == _State.COMPLETE for queue in self.streamid_to_queue.values()
         )
@@ -694,6 +693,111 @@ class Simulator:
             # Occupy all required resources
             self._resource_occupancy.update({res: queue for res in head_op.resources})
             queue.state = _State.RUNNING
+
+    def _process_sync_infos(self, queue: _Queue, head_op: _OpInfo) -> None:
+        #  Every WAITING queue maintains a waiting metadata dictionary that has information
+        #  about the waiting reason (EVENT/STREAM/WORK) and the associated release_event/seq_id
+        #  that will release them from their WAITING STATE.
+        #  Based on the synchronization action associated with the ops, we do the following:
+        sync_infos = queue.sync_infos.pop(head_op.seq_id, set())
+        for sync_info in sync_infos:
+            # i) EVENT_RELEASE: Find queues are waiting (EVENT_WAIT) on this event_id and,
+            #  clear the corresponding wait metadata. It may then be cleared to proceed by
+            #   the `_maybe_update_queue_states` check.
+            if sync_info.sync_action == _SyncAction.EVENT_RELEASE:
+                self._recorded_events.add(sync_info.release_event_id)
+                for ew_queue in self.streamid_to_queue.values():
+                    if (
+                        ew_queue.state == _State.WAITING
+                        and ew_queue.wait_sync_infos.get(
+                            (
+                                _SyncAction.EVENT_WAIT,
+                                sync_info.release_event_id,
+                            )
+                        )
+                    ):
+                        ew_queue.wait_sync_infos.pop(
+                            (
+                                _SyncAction.EVENT_WAIT,
+                                sync_info.release_event_id,
+                            )
+                        )
+            # ii) EVENT_WAIT: If the queue needs to wait on a event, check if that event_id
+            #   has been recorded else enter the WAITING state on the event_id.
+            elif sync_info.sync_action == _SyncAction.EVENT_WAIT:
+                if sync_info.release_event_id not in self._recorded_events:
+                    queue.wait_sync_infos[
+                        (_SyncAction.EVENT_WAIT, sync_info.release_event_id)
+                    ] = sync_info
+                    queue.state = _State.WAITING
+            # iii) STREAM_RELEASE: Find queues are waiting (STREAM_WAIT) on this op's seq_id and,
+            #  clear the corresponding wait metadata. It may then be cleared to proceed by
+            #   the `_maybe_update_queue_states` check.
+            elif sync_info.sync_action == _SyncAction.STREAM_RELEASE:
+                for sw_queue in self.streamid_to_queue.values():
+                    if (
+                        sw_queue.state == _State.WAITING
+                        and sw_queue.wait_sync_infos.get(
+                            (
+                                _SyncAction.STREAM_WAIT,
+                                sync_info.release_seq_id,
+                            )
+                        )
+                    ):
+                        sw_queue.wait_sync_infos.pop(
+                            (
+                                _SyncAction.STREAM_WAIT,
+                                sync_info.release_seq_id,
+                            )
+                        )
+            # iv) STREAM_WAIT: If the queue needs to wait on an op's completion, check if that
+            #   op's seq_id has been completed else enter the WAITING state on the seq_id.
+            elif sync_info.sync_action == _SyncAction.STREAM_WAIT:
+                if sync_info.release_seq_id not in self._completed_ops:
+                    queue.wait_sync_infos[
+                        (_SyncAction.STREAM_WAIT, sync_info.release_seq_id)
+                    ] = sync_info
+                    queue.state = _State.WAITING
+            # v) WORK_RELEASE: Find queues are waiting (WORK_WAIT) on this op's seq_id and,
+            #  clear the corresponding wait metadata. It may then be cleared to proceed by
+            #   the `_maybe_update_queue_states` check.
+            elif sync_info.sync_action == _SyncAction.WORK_RELEASE:
+                for ww_queue in self.streamid_to_queue.values():
+                    if (
+                        ww_queue.state == _State.WAITING
+                        and ww_queue.wait_sync_infos.get(
+                            (
+                                _SyncAction.WORK_WAIT,
+                                sync_info.release_seq_id,
+                            )
+                        )
+                    ):
+                        ww_queue.wait_sync_infos.pop(
+                            (
+                                _SyncAction.WORK_WAIT,
+                                sync_info.release_seq_id,
+                            )
+                        )
+            # vi) WORK_WAIT: If the queue needs to wait on an op's completion, check if that
+            #   op's seq_id has been completed else enter the WAITING state on the seq_id.
+            elif sync_info.sync_action == _SyncAction.WORK_WAIT:
+                if sync_info.release_seq_id not in self._completed_ops:
+                    queue.wait_sync_infos[
+                        (_SyncAction.WORK_WAIT, sync_info.release_seq_id)
+                    ] = sync_info
+                    queue.state = _State.WAITING
+            # vii) SYNCHRONIZE_WAIT: The queue must enter WAITING state for global synchronization.
+            #   The sync_id corresponds the global sync count recorded during capture phase.
+            #   Once all the queues are waiting on the SYNCHRONIZE_WAIT with identical sync_id,
+            #   they may be cleared to proceed by the `_maybe_update_queue_states` check.
+            elif sync_info.sync_action == _SyncAction.SYNCHRONIZE_WAIT:
+                queue.wait_sync_infos[
+                    (_SyncAction.SYNCHRONIZE_WAIT, sync_info.sync_id)
+                ] = sync_info
+                queue.state = _State.WAITING
+
+            else:
+                raise ValueError(f"Unknown _SyncAction: {sync_info.sync_action}")
 
     def simulate(self) -> float:
         """
@@ -743,121 +847,18 @@ class Simulator:
                 head_op.rem_time -= time_step
                 if head_op.rem_time == 0.0:
                     # d. For every completed op, we remove it from its correspnding queue.
-                    #   Change the queue's state to READY. Free-up any resources used by the op.
-                    #   Add the op's seq_id to completed ops set.
+                    #   Change the queue's state to READY.
                     queue = self.streamid_to_queue[head_op.stream_id]
                     queue.ops.pop(0)
                     queue.state = _State.READY
-
+                    # e. Free-up any resources used by the op. Add the op's seq_id to completed ops set.
                     for res in head_op.resources:
                         self._resource_occupancy.pop(res)
-
                     self._completed_ops.add(head_op.seq_id)
-                    # e. Obtain any synchronization operations that must be executed at this op's completion.
-                    #   Every WAITING queue maintains a waiting metadata dictionary that has information
-                    #   about the waiting reason (EVENT/STREAM/WORK) and the associated release_event/seq_id
-                    #   that will release them from their WAITING STATE.
-                    #   Based on the synchronization action associated with the ops, we do the following:
-                    sync_infos = queue.sync_infos.pop(head_op.seq_id, set())
-                    for sync_info in sync_infos:
-                        # i) EVENT_RELEASE: Find queues are waiting (EVENT_WAIT) on this event_id and,
-                        #  clear the corresponding wait metadata. It may then be cleared to proceed by
-                        #   the `_maybe_update_queue_states` check.
-                        if sync_info.sync_action == _SyncAction.EVENT_RELEASE:
-                            self._recorded_events.add(sync_info.release_event_id)
-                            for ew_queue in self.streamid_to_queue.values():
-                                if (
-                                    ew_queue.state == _State.WAITING
-                                    and ew_queue.wait_sync_infos.get(
-                                        (
-                                            _SyncAction.EVENT_WAIT,
-                                            sync_info.release_event_id,
-                                        )
-                                    )
-                                ):
-                                    ew_queue.wait_sync_infos.pop(
-                                        (
-                                            _SyncAction.EVENT_WAIT,
-                                            sync_info.release_event_id,
-                                        )
-                                    )
-                        # ii) EVENT_WAIT: If the queue needs to wait on a event, check if that event_id
-                        #   has been recorded else enter the WAITING state on the event_id.
-                        elif sync_info.sync_action == _SyncAction.EVENT_WAIT:
-                            if sync_info.release_event_id not in self._recorded_events:
-                                queue.wait_sync_infos[
-                                    (_SyncAction.EVENT_WAIT, sync_info.release_event_id)
-                                ] = sync_info
-                                queue.state = _State.WAITING
-                        # iii) STREAM_RELEASE: Find queues are waiting (STREAM_WAIT) on this op's seq_id and,
-                        #  clear the corresponding wait metadata. It may then be cleared to proceed by
-                        #   the `_maybe_update_queue_states` check.
-                        elif sync_info.sync_action == _SyncAction.STREAM_RELEASE:
-                            for sw_queue in self.streamid_to_queue.values():
-                                if (
-                                    sw_queue.state == _State.WAITING
-                                    and sw_queue.wait_sync_infos.get(
-                                        (
-                                            _SyncAction.STREAM_WAIT,
-                                            sync_info.release_seq_id,
-                                        )
-                                    )
-                                ):
-                                    sw_queue.wait_sync_infos.pop(
-                                        (
-                                            _SyncAction.STREAM_WAIT,
-                                            sync_info.release_seq_id,
-                                        )
-                                    )
-                        # iv) STREAM_WAIT: If the queue needs to wait on an op's completion, check if that
-                        #   op's seq_id has been completed else enter the WAITING state on the seq_id.
-                        elif sync_info.sync_action == _SyncAction.STREAM_WAIT:
-                            if sync_info.release_seq_id not in self._completed_ops:
-                                queue.wait_sync_infos[
-                                    (_SyncAction.STREAM_WAIT, sync_info.release_seq_id)
-                                ] = sync_info
-                                queue.state = _State.WAITING
-                        # v) WORK_RELEASE: Find queues are waiting (WORK_WAIT) on this op's seq_id and,
-                        #  clear the corresponding wait metadata. It may then be cleared to proceed by
-                        #   the `_maybe_update_queue_states` check.
-                        elif sync_info.sync_action == _SyncAction.WORK_RELEASE:
-                            for ww_queue in self.streamid_to_queue.values():
-                                if (
-                                    ww_queue.state == _State.WAITING
-                                    and ww_queue.wait_sync_infos.get(
-                                        (
-                                            _SyncAction.WORK_WAIT,
-                                            sync_info.release_seq_id,
-                                        )
-                                    )
-                                ):
-                                    ww_queue.wait_sync_infos.pop(
-                                        (
-                                            _SyncAction.WORK_WAIT,
-                                            sync_info.release_seq_id,
-                                        )
-                                    )
-                        # vi) WORK_WAIT: If the queue needs to wait on an op's completion, check if that
-                        #   op's seq_id has been completed else enter the WAITING state on the seq_id.
-                        elif sync_info.sync_action == _SyncAction.WORK_WAIT:
-                            if sync_info.release_seq_id not in self._completed_ops:
-                                queue.wait_sync_infos[
-                                    (_SyncAction.WORK_WAIT, sync_info.release_seq_id)
-                                ] = sync_info
-                                queue.state = _State.WAITING
-                        # vii) SYNCHRONIZE_WAIT: The queue must enter WAITING state for global synchronization.
-                        #   The sync_id corresponds the global sync count recorded during capture phase.
-                        #   Once all the queues are waiting on the SYNCHRONIZE_WAIT with identical sync_id,
-                        #   they may be cleared to proceed by the `_maybe_update_queue_states` check.
-                        elif sync_info.sync_action == _SyncAction.SYNCHRONIZE_WAIT:
-                            queue.wait_sync_infos[
-                                (_SyncAction.SYNCHRONIZE_WAIT, sync_info.sync_id)
-                            ] = sync_info
-                            queue.state = _State.WAITING
-
-                        else:
-                            raise ValueError(
-                                f"Unknown _SyncAction: {sync_info.sync_action}"
-                            )
+                    # e. Process any synchronization operations that must be executed at this op's completion.
+                    self._process_sync_infos(queue, head_op)
+            # 5. If the sync operations for queues have completed or global sync has been reached mark them as READY.
+            self._maybe_resolve_waiting_queues()
+            self._maybe_resolve_global_sync()
 
         return self._simulated_time
