@@ -214,7 +214,6 @@ def check_sdpa_shapes(query_shape, key_shape, value_shape):
         and h == _h2 == _h3
         and d_qk == _d2
         and s_kv == _s3
-        and d_qk == _d2
     )
     return b, h, s_q, s_kv, d_qk, d_v
 
@@ -439,6 +438,7 @@ def build_conv2d_features(
         groups = in_channels // in_channels_over_groups
 
     if len(filter_size) != 2:
+        raise ValueError(f"filter_size with dimensions {len(filter_size)} not supported")
         return None
     kH, kW = filter_size
 
@@ -497,9 +497,9 @@ def conv_time(
 ) -> float:
     """Only supports Conv2D for now."""
     if transposed:
-        model = get_learned_model("conv", gpu_type)
-    else:
         model = get_learned_model("conv_t", gpu_type)
+    else:
+        model = get_learned_model("conv", gpu_type)
     features = build_conv2d_features(
         gflops,
         dtype,
@@ -537,9 +537,9 @@ def conv_backward_time(
     """
     args = None
     if transposed:
-        model = get_learned_model("conv_backward", gpu_type)
-    else:
         model = get_learned_model("conv_t_backward", gpu_type)
+    else:
+        model = get_learned_model("conv_backward", gpu_type)
     features = build_conv2d_features(
         gflops,
         dtype,
