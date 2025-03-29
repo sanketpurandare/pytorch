@@ -1,7 +1,9 @@
 # Owner(s): ["module: unknown"]
 from functools import wraps
 import os
+import math
 import joblib
+import json
 import pandas as pd
 from typing import Any
 import torch
@@ -22,6 +24,21 @@ LEARNED_OPS: dict[torch._ops.OpOverloadPacket, Any] = {}
 
 # Caches the learned models that predict ops' runtimes.
 _LEARNED_OPS_PREDICTORS: dict[str, Any] = {}
+
+_ROOFLINE_OPS_PARAMETERS: dict[str, Any] | None = None
+_ROOFLINE_OPS_PREDICTORS: dict[str, Any] = {}
+
+dtype_to_bytes = {
+    torch.float32: 4,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+}
+
+dtype_to_str = {
+    torch.float32: "32",
+    torch.float16: "16",
+    torch.bfloat16: "b16",
+}
 
 _MODEL_BASE_DIR = "/n/netscratch/idreos_lab/Everyone"
 
@@ -209,12 +226,7 @@ def check_sdpa_shapes(query_shape, key_shape, value_shape):
     b, h, s_q, d_qk = query_shape
     _b2, _h2, s_kv, _d2 = key_shape
     _b3, _h3, _s3, d_v = value_shape
-    assert (
-        b == _b2 == _b3
-        and h == _h2 == _h3
-        and d_qk == _d2
-        and s_kv == _s3
-    )
+    assert b == _b2 == _b3 and h == _h2 == _h3 and d_qk == _d2 and s_kv == _s3
     return b, h, s_q, s_kv, d_qk, d_v
 
 
@@ -438,7 +450,9 @@ def build_conv2d_features(
         groups = in_channels // in_channels_over_groups
 
     if len(filter_size) != 2:
-        raise ValueError(f"filter_size with dimensions {len(filter_size)} not supported")
+        raise ValueError(
+            f"filter_size with dimensions {len(filter_size)} not supported"
+        )
         return None
     kH, kW = filter_size
 
@@ -555,13 +569,304 @@ def conv_backward_time(
     return float(model.predict(features)[0])
 
 
+class RooflinePredictor:
+    def __init__(
+        self,
+        slope1,
+        slope2,
+        slope3,
+        intercept1,
+        intercept2,
+        intercept3,
+        log_elbow1,
+        log_elbow2,
+    ):
+        self.slope1 = slope1
+        self.slope2 = slope2
+        self.slope3 = slope3
+        self.intercept1 = intercept1
+        self.intercept2 = intercept2
+        self.intercept3 = intercept3
+        self.log_elbow1 = log_elbow1
+        self.log_elbow2 = log_elbow2
+
+    def predict(self, X) -> float:
+        X_log = torch.log(torch.tensor(X, dtype=torch.float32))
+        y_log = torch.where(
+            X_log <= self.log_elbow1,
+            self.slope1 * X_log + self.intercept1,
+            torch.where(
+                X_log <= self.log_elbow2,
+                self.slope2 * X_log + self.intercept2,
+                self.slope3 * X_log + self.intercept3,
+            ),
+        )
+        return torch.exp(y_log)
+
+
+def get_roofline_model(op: str, dtype, device: str):
+    dtype_str = dtype_to_str[dtype]
+    key = "|".join([op, dtype_str, device])
+    if key not in _ROOFLINE_OPS_PREDICTORS:
+        global _ROOFLINE_OPS_PARAMETERS
+        if _ROOFLINE_OPS_PARAMETERS is None:
+            path = os.path.join(
+                _MODEL_BASE_DIR, f"bw_models", "roofline_parameters.json"
+            )
+            with open(path, "r") as f:
+                _ROOFLINE_OPS_PARAMETERS = json.load(f)
+        params = _ROOFLINE_OPS_PARAMETERS[key]
+
+        slope1 = params["slope_1"]
+        slope2 = params["slope_2"]
+        slope3 = 1.0
+        intercept1 = params["intercept"]
+        log_elbow1 = torch.log(params["elbow_1"])
+        log_elbow2 = torch.log(params["elbow_2"])
+
+        # Enforce continuity between segments
+        intercept2 = intercept1 + (slope1 - slope2) * float(log_elbow1)
+        intercept3 = intercept2 + (slope2 - slope3) * float(log_elbow2)
+
+        _ROOFLINE_OPS_PREDICTORS[key] = RooflinePredictor(
+            slope1,
+            slope2,
+            slope3,
+            intercept1,
+            intercept2,
+            intercept3,
+            log_elbow1,
+            log_elbow2,
+        )
+    return _ROOFLINE_OPS_PREDICTORS[key]
+
+
+def get_alloc_size(num_bytes: int):
+    return math.ceil(num_bytes / PYTORCH_MIN_ALLOCATE) * PYTORCH_MIN_ALLOCATE
+
+
+def get_bytes_for_roofline(
+    input_shape: torch.Size, output_shape: torch.Size | None, dtype
+) -> tuple[int, int]:
+    size = dtype_to_bytes[dtype]
+    input_tensor_nbytes = math.prod(input_shape) * size
+    input_size_bytes = get_alloc_size(input_tensor_nbytes)
+
+    if output_shape:
+        output_tensor_nbytes = math.prod(output_shape) * size
+        output_size_bytes = get_alloc_size(output_tensor_nbytes)
+    else:
+        output_size_bytes = 0
+    return input_size_bytes, output_size_bytes
+
+
+def relu_time(gpu_type, dtype, in_shape, out_shape, **kwargs) -> float:
+    model = get_roofline_model("relu", dtype, gpu_type)
+    input_size_bytes, output_size_bytes = get_bytes_for_roofline(
+        in_shape, out_shape, dtype
+    )
+    memory_accesses = input_size_bytes + output_size_bytes
+    return float(model.predict(memory_accesses))
+
+
+def cos_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
+    model = get_roofline_model("cos", dtype, gpu_type)
+    input_size_bytes, output_size_bytes = get_bytes_for_roofline(
+        in_shape, out_shape, dtype
+    )
+    memory_accesses = input_size_bytes + output_size_bytes
+    return float(model.predict(memory_accesses))
+
+
+def sin_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
+    model = get_roofline_model("sin", dtype, gpu_type)
+    input_size_bytes, output_size_bytes = get_bytes_for_roofline(
+        in_shape, out_shape, dtype
+    )
+    memory_accesses = input_size_bytes + output_size_bytes
+    return float(model.predict(memory_accesses))
+
+
+def mean_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
+    model = get_roofline_model("mean", dtype, gpu_type)
+    input_size_bytes, output_size_bytes = get_bytes_for_roofline(
+        in_shape, out_shape, dtype
+    )
+    memory_accesses = input_size_bytes + output_size_bytes
+    return float(model.predict(memory_accesses))
+
+
+def sum_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
+    model = get_roofline_model("sum", dtype, gpu_type)
+    input_size_bytes, output_size_bytes = get_bytes_for_roofline(
+        in_shape, out_shape, dtype
+    )
+    memory_accesses = input_size_bytes + output_size_bytes
+    return float(model.predict(memory_accesses))
+
+
+def max_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
+    model = get_roofline_model("max", dtype, gpu_type)
+    input_size_bytes, output_size_bytes = get_bytes_for_roofline(
+        in_shape, out_shape, dtype
+    )
+    memory_accesses = input_size_bytes + output_size_bytes
+    return float(model.predict(memory_accesses))
+
+
+def min_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
+    model = get_roofline_model("min", dtype, gpu_type)
+    input_size_bytes, output_size_bytes = get_bytes_for_roofline(
+        in_shape, out_shape, dtype
+    )
+    memory_accesses = input_size_bytes + output_size_bytes
+    return float(model.predict(memory_accesses))
+
+
+def prod_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
+    model = get_roofline_model("prod", dtype, gpu_type)
+    input_size_bytes, output_size_bytes = get_bytes_for_roofline(
+        in_shape, out_shape, dtype
+    )
+    memory_accesses = input_size_bytes + output_size_bytes
+    return float(model.predict(memory_accesses))
+
+
+def batch_norm_time(
+    gpu_type,
+    dtype,
+    gflops,
+    in_shape,
+    weight,
+    bias,
+    running_mean,
+    running_var,
+    momentum,
+    eps,
+    out_shape=None,
+    **kwargs,
+) -> float:
+    model = get_roofline_model(f"batchnorm", dtype, gpu_type)
+    input_size_bytes, output_size_bytes = get_bytes_for_roofline(in_shape, None, dtype)
+    memory_accesses = input_size_bytes + output_size_bytes
+    return float(model.predict(memory_accesses))
+
+
+def build_lightweight_learned_features(
+    in_shape, out_shape, dtype, filter_val: int, filter_name: str
+):
+    n_dim = len(in_shape)
+    if n_dim > 4:
+        raise ValueError(f"n_dim {n_dim} not supported! Max is n_dim == 4.")
+
+    if n_dim == 1:
+        dim_1 = in_shape[0]
+        dim_2 = dim_3 = dim_4 = 1
+    elif n_dim == 2:
+        dim_1, dim_2 = in_shape
+        dim_3 = dim_4 = 1
+    elif n_dim == 3:
+        dim_1, dim_2, dim_3 = in_shape
+        dim_4 = 1
+    else:
+        dim_1, dim_2, dim_3, dim_4 = in_shape
+
+    input_size_bytes, output_size_bytes = get_bytes_for_roofline(
+        in_shape, out_shape, dtype
+    )
+    dtypes = convert_dtype(dtype)
+    features = {
+        "dim_1": dim_1,
+        "dim_2": dim_2,
+        "dim_3": dim_3,
+        "dim_4": dim_4,
+        "input_size_bytes": input_size_bytes,
+        "output_size_bytes": output_size_bytes,
+        "n_dim": n_dim,
+        "dtype_16": dtypes["dtype_16"],
+        "dtype_32": dtypes["dtype_32"],
+        "dtype_b16": dtypes["dtype_b16"],
+        filter_name: filter_val,
+    }
+    return features
+
+
+def softmax_time(
+    gpu_type, dtype, gflops, in_shape, dim, *args, out_shape, **kwargs
+) -> float:
+    """
+    For softmax, we consider which dimension to filter over.
+    """
+    if dim > 3:
+        raise ValueError(f"dim {dim} not supported! Max is dim == 3.")
+    model = get_learned_model(f"softmax", gpu_type)
+    features = build_lightweight_learned_features(
+        in_shape, out_shape, dtype, dim, "dim"
+    )
+    return float(model.predict(features)[0])
+
+
+def log_softmax_time(
+    gpu_type, dtype, gflops, in_shape, dim, *args, out_shape, **kwargs
+) -> float:
+    """
+    For log_softmax, we consider which dimension to filter over.
+    """
+    if dim > 3:
+        raise ValueError(f"dim {dim} not supported! Max is dim == 3.")
+    model = get_learned_model(f"log_softmax", gpu_type)
+    features = build_lightweight_learned_features(
+        in_shape, out_shape, dtype, dim, "dim"
+    )
+    return float(model.predict(features)[0])
+
+
+def group_norm_time(
+    gpu_type,
+    dtype,
+    gflops,
+    in_shape,
+    weight,
+    bias,
+    batch,
+    channels,
+    features,
+    groups,
+    eps,
+    out_shape=None,
+    **kwargs,
+) -> float:
+    model = get_learned_model(f"groupnorm", gpu_type)
+    # The input shape == the output shape.
+    features = build_lightweight_learned_features(
+        in_shape, in_shape, dtype, groups, "groups"
+    )
+    return float(model.predict(features)[0])
+
+
+def layer_norm_time(
+    gpu_type,
+    dtype,
+    gflops,
+    in_shape,
+    norm_shape,
+    weight,
+    bias,
+    eps,
+    out_shape=None,
+    **kwargs,
+) -> float:
+    start_dim = len(in_shape) - len(norm_shape)
+    model = get_learned_model(f"layernorm", gpu_type)
+    # The input shape == the output shape.
+    features = build_lightweight_learned_features(
+        in_shape, in_shape, dtype, start_dim, "start_dim"
+    )
+    return float(model.predict(features)[0])
+
+
 def learned_estimate_predictor(func_packet, args, kwargs, out, out_dtypes, gpu_type) -> float:  # type: ignore[no-untyped-def]
     """
-    TODO:
-        1) the order of the features
-        2) where the models are stored
-
-
     Estimates the compute time of an aten operator.
 
     Args:
@@ -574,8 +879,6 @@ def learned_estimate_predictor(func_packet, args, kwargs, out, out_dtypes, gpu_t
     Returns:
         float: The estimated compute time in milliseconds.
 
-
-    # TODO: comments.
     Note: for the prediction functions, we mimic the arguments for mm_flop.
     """
     # assert (
@@ -583,11 +886,15 @@ def learned_estimate_predictor(func_packet, args, kwargs, out, out_dtypes, gpu_t
     # ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
     # dtype = out_dtypes.pop()
     dtype = min(out_dtypes, key=lambda x: x.itemsize)
-    flop_count_func = flop_registry[func_packet]
-    gflops = flop_count_func(*args, **kwargs, out_val=out) / 1e9
+    if func_packet in flop_registry:
+        flop_count_func = flop_registry[func_packet]
+        gflops = flop_count_func(*args, **kwargs, out_val=out) / 1e9
+    else:
+        gflops = 0
     predictor_func = LEARNED_OPS[func_packet]
     op_time = predictor_func(gpu_type, dtype, gflops, *args, **kwargs, out_val=out)
     return op_time
+
 
 #####################
 #### OP REGISTRY ####
@@ -600,11 +907,41 @@ LEARNED_OPS[aten.addmm] = shape_wrapper(addmm_time)
 LEARNED_OPS[aten.bmm] = shape_wrapper(bmm_time)
 LEARNED_OPS[aten.baddbmm] = shape_wrapper(baddbmm_time)
 LEARNED_OPS[aten._scaled_dot_product_cudnn_attention] = shape_wrapper(sdpa_cudnn_time)
-LEARNED_OPS[aten._scaled_dot_product_efficient_attention] = shape_wrapper(sdpa_efficient_time)
+LEARNED_OPS[aten._scaled_dot_product_efficient_attention] = shape_wrapper(
+    sdpa_efficient_time
+)
 LEARNED_OPS[aten._scaled_dot_product_flash_attention] = shape_wrapper(sdpa_flash_time)
-LEARNED_OPS[aten._scaled_dot_product_cudnn_attention_backward] = shape_wrapper(sdpa_backward_cudnn_time)
-LEARNED_OPS[aten._scaled_dot_product_efficient_attention_backward] = shape_wrapper(sdpa_backward_efficient_time)
-LEARNED_OPS[aten._scaled_dot_product_flash_attention_backward] = shape_wrapper(sdpa_backward_flash_time)
+LEARNED_OPS[aten._scaled_dot_product_cudnn_attention_backward] = shape_wrapper(
+    sdpa_backward_cudnn_time
+)
+LEARNED_OPS[aten._scaled_dot_product_efficient_attention_backward] = shape_wrapper(
+    sdpa_backward_efficient_time
+)
+LEARNED_OPS[aten._scaled_dot_product_flash_attention_backward] = shape_wrapper(
+    sdpa_backward_flash_time
+)
 LEARNED_OPS[aten.convolution] = shape_wrapper(conv_time)
 LEARNED_OPS[aten._convolution] = shape_wrapper(conv_time)
 LEARNED_OPS[aten.convolution_backward] = shape_wrapper(conv_backward_time)
+
+
+# Decision Tree Ops
+
+LEARNED_OPS[aten._softmax] = shape_wrapper(softmax_time)
+LEARNED_OPS[aten._log_softmax] = shape_wrapper(log_softmax_time)
+LEARNED_OPS[aten.native_group_norm] = shape_wrapper(group_norm_time)
+LEARNED_OPS[aten.native_layer_norm] = shape_wrapper(layer_norm_time)
+
+
+# Roofline Model Ops
+
+LEARNED_OPS[aten.relu] = shape_wrapper(relu_time)
+LEARNED_OPS[aten.cos] = shape_wrapper(cos_time)
+LEARNED_OPS[aten.sin] = shape_wrapper(sin_time)
+LEARNED_OPS[aten.mean] = shape_wrapper(mean_time)
+LEARNED_OPS[aten.sum] = shape_wrapper(sum_time)
+LEARNED_OPS[aten.max] = shape_wrapper(max_time)
+LEARNED_OPS[aten.min] = shape_wrapper(min_time)
+LEARNED_OPS[aten.prod] = shape_wrapper(prod_time)
+LEARNED_OPS[aten._native_batch_norm_legit] = shape_wrapper(batch_norm_time)
+LEARNED_OPS[aten._native_batch_norm_legit_no_training] = shape_wrapper(batch_norm_time)
