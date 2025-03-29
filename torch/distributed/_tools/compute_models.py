@@ -53,34 +53,6 @@ def shape_wrapper(f):
     return nf
 
 
-def register_timing_formula(targets, get_raw=False):
-    """
-    Similar to flop_counter.register_flop_formula().
-    """
-
-    def register_fun(time_formula):
-        if not get_raw:
-            time_formula = shape_wrapper(time_formula)
-
-        def register(target):
-            if not isinstance(target, torch._ops.OpOverloadPacket):
-                raise ValueError(
-                    f"register_flop_formula(targets): expected each target to be "
-                    f"OpOverloadPacket (i.e. torch.ops.mylib.foo), got "
-                    f"{target} which is of type {type(target)}"
-                )
-            if target in LEARNED_OPS:
-                raise RuntimeError(f"duplicate registrations for {target}")
-            LEARNED_OPS[target] = time_formula
-
-        # To handle allowing multiple aten_ops at once
-        tree_map_(register, targets)
-
-        return time_formula
-
-    return register_fun
-
-
 def convert_dtype(dtype) -> dict[str, int]:
     """
     Convert dtype to a one-hot encoding as a pandas Series.
@@ -96,7 +68,6 @@ def convert_dtype(dtype) -> dict[str, int]:
     return dict(zip(dtype_names, dtype_one_hot))
 
 
-@register_timing_formula(aten.mm)
 def mm_time(
     gpu_type, dtype, gflops, a_shape, b_shape, *args, out_shape=None, **kwargs
 ) -> float:
@@ -130,14 +101,12 @@ def mm_time(
     return float(model.predict(features_df)[0])
 
 
-@register_timing_formula(aten.addmm)
 def addmm_time(
     gpu_type, dtype, gflops, self_shape, a_shape, b_shape, out_shape=None, **kwargs
 ) -> float:
     return mm_time(gpu_type, dtype, gflops, a_shape, b_shape)
 
 
-@register_timing_formula(aten.bmm)
 def bmm_time(
     gpu_type, dtype, gflops, a_shape, b_shape, out_shape=None, **kwargs
 ) -> float:
@@ -171,7 +140,6 @@ def bmm_time(
     return float(model.predict(features_df)[0])
 
 
-@register_timing_formula(aten.baddbmm)
 def baddbmm_time(
     gpu_type, dtype, gflops, self_shape, a_shape, b_shape, out_shape=None, **kwargs
 ) -> float:
@@ -267,7 +235,6 @@ def check_sdpa_shapes_backward(query_shape, key_shape, value_shape, grad_out_sha
     return b, h, s_q, s_kv, d_qk, d_v
 
 
-@register_timing_formula(aten._scaled_dot_product_cudnn_attention)
 def sdpa_cudnn_time(
     gpu_type,
     dtype,
@@ -296,7 +263,6 @@ def sdpa_cudnn_time(
     return float(model.predict(features)[0])
 
 
-@register_timing_formula(aten._scaled_dot_product_efficient_attention)
 def sdpa_efficient_time(
     gpu_type,
     dtype,
@@ -325,7 +291,6 @@ def sdpa_efficient_time(
     return float(model.predict(features)[0])
 
 
-@register_timing_formula(aten._scaled_dot_product_flash_attention)
 def sdpa_flash_time(
     gpu_type,
     dtype,
@@ -354,7 +319,6 @@ def sdpa_flash_time(
     return float(model.predict(features)[0])
 
 
-@register_timing_formula(aten._scaled_dot_product_cudnn_attention_backward)
 def sdpa_backward_cudnn_time(
     gpu_type,
     dtype,
@@ -386,7 +350,6 @@ def sdpa_backward_cudnn_time(
     return float(model.predict(features)[0])
 
 
-@register_timing_formula(aten._scaled_dot_product_efficient_attention_backward)
 def sdpa_backward_efficient_time(
     gpu_type,
     dtype,
@@ -418,7 +381,6 @@ def sdpa_backward_efficient_time(
     return float(model.predict(features)[0])
 
 
-@register_timing_formula(aten._scaled_dot_product_flash_attention_backward)
 def sdpa_backward_flash_time(
     gpu_type,
     dtype,
@@ -518,7 +480,6 @@ def build_conv2d_features(
     return pd.DataFrame([features])
 
 
-@register_timing_formula([aten.convolution, aten._convolution])
 def conv_time(
     gpu_type,
     dtype,
@@ -554,7 +515,6 @@ def conv_time(
     return float(model.predict(features)[0])
 
 
-@register_timing_formula(aten.convolution_backward)
 def conv_backward_time(
     gpu_type,
     dtype,
@@ -628,3 +588,23 @@ def learned_estimate_predictor(func_packet, args, kwargs, out, out_dtypes, gpu_t
     predictor_func = LEARNED_OPS[func_packet]
     op_time = predictor_func(gpu_type, dtype, gflops, *args, **kwargs, out_val=out)
     return op_time
+
+#####################
+#### OP REGISTRY ####
+#####################
+
+# Random Forest Ops
+
+LEARNED_OPS[aten.mm] = shape_wrapper(mm_time)
+LEARNED_OPS[aten.addmm] = shape_wrapper(addmm_time)
+LEARNED_OPS[aten.bmm] = shape_wrapper(bmm_time)
+LEARNED_OPS[aten.baddbmm] = shape_wrapper(baddbmm_time)
+LEARNED_OPS[aten._scaled_dot_product_cudnn_attention] = shape_wrapper(sdpa_cudnn_time)
+LEARNED_OPS[aten._scaled_dot_product_efficient_attention] = shape_wrapper(sdpa_efficient_time)
+LEARNED_OPS[aten._scaled_dot_product_flash_attention] = shape_wrapper(sdpa_flash_time)
+LEARNED_OPS[aten._scaled_dot_product_cudnn_attention_backward] = shape_wrapper(sdpa_backward_cudnn_time)
+LEARNED_OPS[aten._scaled_dot_product_efficient_attention_backward] = shape_wrapper(sdpa_backward_efficient_time)
+LEARNED_OPS[aten._scaled_dot_product_flash_attention_backward] = shape_wrapper(sdpa_backward_flash_time)
+LEARNED_OPS[aten.convolution] = shape_wrapper(conv_time)
+LEARNED_OPS[aten._convolution] = shape_wrapper(conv_time)
+LEARNED_OPS[aten.convolution_backward] = shape_wrapper(conv_backward_time)
