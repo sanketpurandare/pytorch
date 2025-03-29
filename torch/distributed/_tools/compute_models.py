@@ -42,7 +42,7 @@ def get_shape(i):
 
 def shape_wrapper(f):
     """
-    Similar to flop_counter.shape_wrapper(), but also takes takes gflops.
+    Similar to flop_counter.shape_wrapper(), but also takes takes other args.
     """
 
     @wraps(f)
