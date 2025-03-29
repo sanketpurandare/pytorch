@@ -16,6 +16,7 @@ from torch.distributed._tools.common_utils import get_flattened_tensor
 from torch.distributed._tools.compute_models import (
     learned_estimate_predictor,
     LEARNED_OPS,
+    PYTORCH_MIN_ALLOCATE,
 )
 from torch.distributed._tools.fake_collectives import (
     collective_ops,
@@ -41,11 +42,6 @@ from torch.utils.flop_counter import flop_registry
 
 aten = torch.ops.aten
 
-# This value is hard-coded here:
-# https://github.com/pytorch/pytorch/blob/5fba5d83f0703ff8077ab65448a998e9ad6598fd/c10/cuda/CUDACachingAllocator.cpp#L117
-_PYTORCH_MIN_ALLOCATE = (
-    2**9 if int(os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING", 0)) == 0 else 1
-)
 _MiB = 2**20
 
 _VIEW_OR_CREATE_OPS = VIEW_OPS | CREATE_OPS
@@ -400,7 +396,7 @@ class RuntimeEstimator(TorchDispatchMode):
             """
             num_bytes = t.untyped_storage().nbytes()
             mem_consumed = (
-                math.ceil(num_bytes / _PYTORCH_MIN_ALLOCATE) * _PYTORCH_MIN_ALLOCATE
+                math.ceil(num_bytes / PYTORCH_MIN_ALLOCATE) * PYTORCH_MIN_ALLOCATE
             )
             return mem_consumed
 

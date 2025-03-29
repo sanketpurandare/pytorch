@@ -11,6 +11,12 @@ from torch.utils.flop_counter import flop_registry
 
 aten = torch.ops.aten
 
+# This value is hard-coded here:
+# https://github.com/pytorch/pytorch/blob/5fba5d83f0703ff8077ab65448a998e9ad6598fd/c10/cuda/CUDACachingAllocator.cpp#L117
+PYTORCH_MIN_ALLOCATE = (
+    2**9 if int(os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING", 0)) == 0 else 1
+)
+
 # Similar to `flop_registry`, stores the operators that have learned predictors
 LEARNED_OPS: dict[torch._ops.OpOverloadPacket, Any] = {}
 
