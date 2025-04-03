@@ -661,7 +661,7 @@ def get_bytes_for_roofline(
 
 
 def relu_time(gpu_type, dtype, in_shape, out_shape, **kwargs) -> float:
-    model = get_roofline_model("relu", dtype, gpu_type)
+    model = get_roofline_model("elementwise", dtype, gpu_type)
     input_size_bytes, output_size_bytes = get_bytes_for_roofline(
         in_shape, out_shape, dtype
     )
@@ -670,7 +670,7 @@ def relu_time(gpu_type, dtype, in_shape, out_shape, **kwargs) -> float:
 
 
 def cos_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
-    model = get_roofline_model("cos", dtype, gpu_type)
+    model = get_roofline_model("elementwise", dtype, gpu_type)
     input_size_bytes, output_size_bytes = get_bytes_for_roofline(
         in_shape, out_shape, dtype
     )
@@ -679,7 +679,7 @@ def cos_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
 
 
 def sin_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
-    model = get_roofline_model("sin", dtype, gpu_type)
+    model = get_roofline_model("elementwise", dtype, gpu_type)
     input_size_bytes, output_size_bytes = get_bytes_for_roofline(
         in_shape, out_shape, dtype
     )
@@ -688,7 +688,7 @@ def sin_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
 
 
 def mean_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
-    model = get_roofline_model("mean", dtype, gpu_type)
+    model = get_roofline_model("reduction", dtype, gpu_type)
     input_size_bytes, output_size_bytes = get_bytes_for_roofline(
         in_shape, out_shape, dtype
     )
@@ -697,7 +697,7 @@ def mean_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
 
 
 def sum_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
-    model = get_roofline_model("sum", dtype, gpu_type)
+    model = get_roofline_model("reduction", dtype, gpu_type)
     input_size_bytes, output_size_bytes = get_bytes_for_roofline(
         in_shape, out_shape, dtype
     )
@@ -706,7 +706,7 @@ def sum_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
 
 
 def max_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
-    model = get_roofline_model("max", dtype, gpu_type)
+    model = get_roofline_model("reduction", dtype, gpu_type)
     input_size_bytes, output_size_bytes = get_bytes_for_roofline(
         in_shape, out_shape, dtype
     )
@@ -715,7 +715,7 @@ def max_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
 
 
 def min_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
-    model = get_roofline_model("min", dtype, gpu_type)
+    model = get_roofline_model("reduction", dtype, gpu_type)
     input_size_bytes, output_size_bytes = get_bytes_for_roofline(
         in_shape, out_shape, dtype
     )
@@ -724,7 +724,7 @@ def min_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
 
 
 def prod_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
-    model = get_roofline_model("prod", dtype, gpu_type)
+    model = get_roofline_model("reduction", dtype, gpu_type)
     input_size_bytes, output_size_bytes = get_bytes_for_roofline(
         in_shape, out_shape, dtype
     )
