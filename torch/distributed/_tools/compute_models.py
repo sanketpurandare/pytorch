@@ -732,28 +732,8 @@ def prod_time(gpu_type, dtype, gflops, in_shape, out_shape, **kwargs) -> float:
     return float(model.predict(memory_accesses))
 
 
-def batch_norm_time(
-    gpu_type,
-    dtype,
-    gflops,
-    in_shape,
-    weight,
-    bias,
-    running_mean,
-    running_var,
-    momentum,
-    eps,
-    out_shape=None,
-    **kwargs,
-) -> float:
-    model = get_roofline_model(f"batchnorm", dtype, gpu_type)
-    input_size_bytes, output_size_bytes = get_bytes_for_roofline(in_shape, None, dtype)
-    memory_accesses = input_size_bytes + output_size_bytes
-    return float(model.predict(memory_accesses))
-
-
 def build_lightweight_learned_features(
-    in_shape, out_shape, dtype, filter_val: int, filter_name: str
+    in_shape, out_shape, dtype, filter_val: int | None, filter_name: str | None
 ):
     n_dim = len(in_shape)
     if n_dim > 4:
@@ -786,8 +766,9 @@ def build_lightweight_learned_features(
         "dtype_16": dtypes["dtype_16"],
         "dtype_32": dtypes["dtype_32"],
         "dtype_b16": dtypes["dtype_b16"],
-        filter_name: filter_val,
     }
+    if filter_name is not None:
+        features[filter_name] = filter_val
     return features
 
 
@@ -865,6 +846,25 @@ def layer_norm_time(
     return float(model.predict(features)[0])
 
 
+def batch_norm_time(
+    gpu_type,
+    dtype,
+    gflops,
+    in_shape,
+    weight,
+    bias,
+    running_mean,
+    running_var,
+    momentum,
+    eps,
+    out_shape=None,
+    **kwargs,
+) -> float:
+    model = get_learned_model(f"batchnorm", dtype, gpu_type)
+    features = build_lightweight_learned_features(in_shape, in_shape, dtype, None, None)
+    return float(model.predict(features)[0])
+
+
 def learned_estimate_predictor(func_packet, args, kwargs, out, out_dtypes, gpu_type) -> float:  # type: ignore[no-untyped-def]
     """
     Estimates the compute time of an aten operator.
@@ -931,6 +931,8 @@ LEARNED_OPS[aten._softmax] = shape_wrapper(softmax_time)
 LEARNED_OPS[aten._log_softmax] = shape_wrapper(log_softmax_time)
 LEARNED_OPS[aten.native_group_norm] = shape_wrapper(group_norm_time)
 LEARNED_OPS[aten.native_layer_norm] = shape_wrapper(layer_norm_time)
+LEARNED_OPS[aten._native_batch_norm_legit] = shape_wrapper(batch_norm_time)
+LEARNED_OPS[aten._native_batch_norm_legit_no_training] = shape_wrapper(batch_norm_time)
 
 
 # Roofline Model Ops
@@ -943,5 +945,3 @@ LEARNED_OPS[aten.sum] = shape_wrapper(sum_time)
 LEARNED_OPS[aten.max] = shape_wrapper(max_time)
 LEARNED_OPS[aten.min] = shape_wrapper(min_time)
 LEARNED_OPS[aten.prod] = shape_wrapper(prod_time)
-LEARNED_OPS[aten._native_batch_norm_legit] = shape_wrapper(batch_norm_time)
-LEARNED_OPS[aten._native_batch_norm_legit_no_training] = shape_wrapper(batch_norm_time)
